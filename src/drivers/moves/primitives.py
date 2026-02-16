@@ -13,6 +13,53 @@ from reachy_mini.utils.interpolation import (
 
 from .types import FullBodyPose
 
+class TargetMove(Move):
+    """Move to a specific target pose with linear interpolation."""
+
+    def __init__(
+        self,
+        start_pose: NDArray[np.float64],
+        start_antennas: Tuple[float, float],
+        target_pose: NDArray[np.float64],
+        target_antennas: Tuple[float, float],
+        duration: float,
+    ):
+        """Initialize target move.
+
+        Args:
+            start_pose: Starting head pose matrix
+            start_antennas: Starting antenna positions
+            target_pose: Target head pose matrix
+            target_antennas: Target antenna positions
+            duration: Duration of the move in seconds
+        """
+        self.start_pose = start_pose
+        self.start_antennas = np.array(start_antennas)
+        self.target_pose = target_pose
+        self.target_antennas = np.array(target_antennas)
+        self._duration = duration
+
+    @property
+    def duration(self) -> float:
+        """Return move duration."""
+        return self._duration
+
+    def evaluate(self, t: float) -> tuple[NDArray[np.float64] | None, NDArray[np.float64] | None, float | None]:
+        """Evaluate move at time t."""
+        if t >= self._duration:
+            return (self.target_pose, self.target_antennas, 0.0)
+
+        alpha = t / self._duration
+
+        # Interpolate head pose
+        head_pose = linear_pose_interpolation(self.start_pose, self.target_pose, alpha)
+
+        # Interpolate antennas
+        antennas_interp = (1 - alpha) * self.start_antennas + alpha * self.target_antennas
+        antennas = antennas_interp.astype(np.float64)
+
+        return (head_pose, antennas, 0.0)
+
 class BreathingMove(Move):
     """Breathing move with interpolation to neutral and then continuous breathing patterns."""
 
