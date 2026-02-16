@@ -1,0 +1,9 @@
+fastmcp
+numpy
+pyaudio
+requests
+python-dotenv
+google-genai
+reachy-mini[gstreamer]
+pyttsx3
+opencv-contrib-python

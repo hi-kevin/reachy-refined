@@ -1,0 +1,10 @@
+
+__pycache__/
+*.pyc
+.venv/
+.env
+.DS_Store
+Thumbs.db
+memories.db
+.vscode/
+reachy-refined.code-workspace
