@@ -32,6 +32,7 @@ try:
     from src.brain.cognitive import CognitiveBrain
     from src.brain.robotics import RoboticsBrain
     from src.memory.server import MemoryServer
+    from src.face_watcher import FaceWatcher
 except ImportError:
     # Fallback for running directly from src/
     try:
@@ -40,6 +41,7 @@ except ImportError:
         from brain.cognitive import CognitiveBrain
         from brain.robotics import RoboticsBrain
         from memory.server import MemoryServer
+        from face_watcher import FaceWatcher
         from reachy_mini import ReachyMini
     except ImportError as e:
         logger.error(f"Import Error: {e}")
@@ -49,16 +51,17 @@ robot = None
 stream = None
 brain = None
 moves = None
+watcher = None
 
 async def main():
-    global robot, stream, brain, moves
+    global robot, stream, brain, moves, watcher
 
     logger.info("--- Reachy Gemini Refactor Starting ---")
 
     # 1. Initialize Robot
     logger.info("Initializing ReachyMini...")
     robot = ReachyMini()
-    
+
     # 2. Initialize Movement Manager (Controls head/antennas)
     logger.info("Initializing MovementManager...")
     moves = MovementManager(robot)
@@ -76,16 +79,20 @@ async def main():
     logger.info("Initializing CognitiveBrain (Audio/Reasoning)...")
     brain = CognitiveBrain(robotics_brain=vision, memory_server=memory)
 
-    # 6. Initialize Audio Stream - connect to brain
+    # 6. Start Face Watcher - gates mic and drives antenna state
+    logger.info("Initializing FaceWatcher...")
+    watcher = FaceWatcher(robot=robot, movement_manager=moves, brain=brain)
+    watcher.start()
+
+    # 7. Initialize Audio Stream - connect to brain, gated by face watcher
     logger.info("Initializing LocalStream...")
-    # LocalStream expects a handler with receive/emit/shutdown
-    stream = LocalStream(handler=brain, robot=robot)
-    
-    # 7. Launch Audio Stream
+    stream = LocalStream(handler=brain, robot=robot, face_watcher=watcher)
+
+    # 8. Launch Audio Stream (mic hardware always running; gating is in record_loop)
     logger.info("Launching Audio Stream...")
     stream.launch()
 
-    # 8. Start Brain Loop (Blocks until shutdown)
+    # 9. Start Brain Loop (Blocks until shutdown)
     logger.info("Starting Brain Loop (Gemini Live)...")
     try:
         await brain.start_up()
@@ -98,11 +105,15 @@ async def main():
 
 async def shutdown(sig, loop):
     logger.info(f"Received exit signal {sig.name}...")
-    
+
+    if watcher:
+        logger.info("Stopping face watcher...")
+        watcher.stop()
+
     if stream:
         logger.info("Closing audio stream...")
         stream.close()
-    
+
     if brain:
         logger.info("Stopping brain...")
         await brain.shutdown()

@@ -60,6 +60,7 @@ class MovementManager:
         self._antenna_blend_duration = 0.4  # seconds to blend back after listening
         self._last_listening_blend_time = self._now()
         self._breathing_active = False  # true when breathing move is running or queued
+        self._sleeping = True  # when True, breathing is suppressed (robot is idle / no face)
         self._listening_debounce_s = 0.15
         self._last_listening_toggle_time = self._now()
         self._last_set_target_err = 0.0
@@ -125,6 +126,17 @@ class MovementManager:
             return False
 
         return self._now() - last_activity >= self.idle_inactivity_delay
+
+    def set_sleeping(self, sleeping: bool) -> None:
+        """Enable or disable sleeping mode.
+
+        When sleeping: breathing is suppressed, the move queue is cleared, and
+        the robot holds whatever pose it ends up in (typically antennas-down
+        from an AntennaMove queued just before this call).
+
+        When waking: breathing is allowed to resume after the idle delay.
+        """
+        self._command_queue.put(("set_sleeping", sleeping))
 
     def set_listening(self, listening: bool) -> None:
         """Enable or disable listening mode without touching shared state directly."""
@@ -202,6 +214,19 @@ class MovementManager:
             self.state.update_activity()
         elif command == "mark_activity":
             self.state.update_activity()
+        elif command == "set_sleeping":
+            was_sleeping = self._sleeping
+            self._sleeping = bool(payload)
+            if self._sleeping and not was_sleeping:
+                # Entering sleep: kill any current move and queue so robot holds still
+                self.move_queue.clear()
+                self.state.current_move = None
+                self.state.move_start_time = None
+                self._breathing_active = False
+                logger.info("MovementManager: entering SLEEP mode — breathing suppressed")
+            elif not self._sleeping and was_sleeping:
+                logger.info("MovementManager: entering AWAKE mode — breathing enabled")
+                self.state.update_activity()  # restart idle timer for breathing
         elif command == "set_listening":
             desired_state = bool(payload)
             now = self._now()
@@ -257,6 +282,7 @@ class MovementManager:
             and not self.move_queue
             and not self._is_listening
             and not self._breathing_active
+            and not self._sleeping
         ):
             idle_for = current_time - self.state.last_activity_time
             if idle_for >= self.idle_inactivity_delay:
@@ -452,15 +478,15 @@ class MovementManager:
 
         variance = stats.m2 / stats.count if stats.count > 0 else 0.0
         lowest = stats.min_freq if stats.min_freq != float("inf") else 0.0
-        logger.debug(
-            "Loop freq - avg: %.2fHz, variance: %.4f, min: %.2fHz, last: %.2fHz, potential: %.2fHz, target: %.1fHz",
-            stats.mean,
-            variance,
-            lowest,
-            stats.last_freq,
-            stats.potential_freq,
-            self.target_frequency,
-        )
+        # logger.debug(
+        #     "Loop freq - avg: %.2fHz, variance: %.4f, min: %.2fHz, last: %.2fHz, potential: %.2fHz, target: %.1fHz",
+        #     stats.mean,
+        #     variance,
+        #     lowest,
+        #     stats.last_freq,
+        #     stats.potential_freq,
+        #     self.target_frequency,
+        # )
         stats.reset()
 
     def _update_face_tracking(self, current_time: float) -> None:

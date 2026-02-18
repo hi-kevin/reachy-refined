@@ -9,7 +9,7 @@ import asyncio
 import logging
 import numpy as np
 import collections
-from typing import Any, List, Optional, Tuple, Protocol
+from typing import Any, List, Optional, Tuple, Protocol, TYPE_CHECKING
 from scipy.signal import resample
 
 from reachy_mini import ReachyMini
@@ -41,10 +41,20 @@ class LocalStream:
         self,
         handler: AudioHandler,
         robot: ReachyMini,
+        face_watcher: Optional[Any] = None,
     ):
-        """Initialize the stream with a handler and robot instance."""
+        """Initialize the stream with a handler and robot instance.
+
+        Args:
+            handler: The brain component that consumes/produces audio.
+            robot: ReachyMini SDK instance.
+            face_watcher: Optional FaceWatcher whose face_present property gates
+                          the mic → Gemini audio path. When None, audio is always
+                          forwarded (original behaviour).
+        """
         self.handler = handler
         self._robot = robot
+        self._face_watcher = face_watcher
         self._playback_end_time = 0.0
         self._stop_event = asyncio.Event()
         self._tasks: List[asyncio.Task[None]] = []
@@ -90,12 +100,18 @@ class LocalStream:
                 task.cancel()
 
     async def record_loop(self) -> None:
-        """Read mic frames from the recorder and forward them to the handler."""
+        """Read mic frames from the recorder and forward them to the handler.
+
+        When a face_watcher is configured, audio is only forwarded to Gemini
+        while face_present is True. The mic hardware keeps running regardless
+        so we don't miss the first frames when a face appears.
+        """
         input_sample_rate = self._robot.media.get_input_audio_samplerate()
         logger.debug(f"Audio recording started at {input_sample_rate} Hz")
-        
+
         has_logged_rate = False
-        
+        _mic_active_logged = False
+
         # Periodic audio stats (once per second instead of per-frame)
         _stats_time = time.time()
         _frame_count = 0
@@ -107,27 +123,38 @@ class LocalStream:
                 logger.info(f"Actual Input Sample Rate: {input_sample_rate}")
                 has_logged_rate = True
 
-            # Get audio sample from SDK
+            # Gate: only send audio to Gemini when a face is present
+            face_active = (
+                self._face_watcher is None or self._face_watcher.face_present
+            )
+
+            if face_active and not _mic_active_logged:
+                logger.info("[MIC START] Face present — begin forwarding audio to Gemini.")
+                _mic_active_logged = True
+            elif not face_active and _mic_active_logged:
+                logger.info("[MIC PAUSED] No face — audio gated (mic hardware still running).")
+                _mic_active_logged = False
+
+            # Get audio sample from SDK (always drain the buffer)
             audio_frame = self._robot.media.get_audio_sample()
-            
-            if audio_frame is not None:
-                if len(audio_frame) > 0:
-                     rms = np.sqrt(np.mean(audio_frame**2))
-                     _frame_count += 1
-                     _rms_sum += rms
-                     _rms_max = max(_rms_max, rms)
+
+            if audio_frame is not None and len(audio_frame) > 0 and face_active:
+                rms = np.sqrt(np.mean(audio_frame**2))
+                _frame_count += 1
+                _rms_sum += rms
+                _rms_max = max(_rms_max, rms)
                 await self.handler.receive((input_sample_rate, audio_frame))
-            
-            # Log summary once per second
+
+            # Log summary once per 5 seconds (only when active)
             now = time.time()
-            if now - _stats_time >= 1.0 and _frame_count > 0:
+            if now - _stats_time >= 5.0 and _frame_count > 0:
                 avg_rms = _rms_sum / _frame_count
-                logger.info(f"[MIC] frames={_frame_count}, avg_rms={avg_rms:.4f}, max_rms={_rms_max:.4f}")
+                logger.info(f"[MIC ACTIVE] frames={_frame_count}, avg_rms={avg_rms:.4f}, max_rms={_rms_max:.4f}")
                 _frame_count = 0
                 _rms_sum = 0.0
                 _rms_max = 0.0
                 _stats_time = now
-            
+
             await asyncio.sleep(0.01)  # Yield to avoid busy loop
 
     async def play_loop(self) -> None:

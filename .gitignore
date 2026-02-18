@@ -8,3 +8,6 @@ Thumbs.db
 memories.db
 .vscode/
 reachy-refined.code-workspace
+*.log
+*.out
+_output/

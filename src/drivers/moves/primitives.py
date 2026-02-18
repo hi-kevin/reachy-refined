@@ -82,6 +82,36 @@ class BreathingMove(Move):
         return (head_pose, antennas, 0.0)
 
 
+class AntennaMove(Move):
+    """Smoothly interpolate both antennas to a target position.
+
+    Returns None for head and body_yaw so MovementManager preserves the last
+    cached primary head pose — antennas move without disturbing any concurrent
+    head positioning.
+    """
+
+    def __init__(
+        self,
+        target_antennas: Tuple[float, float],
+        duration: float,
+        start_antennas: Tuple[float, float] = (0.0, 0.0),
+    ) -> None:
+        self._target = np.array(target_antennas, dtype=np.float64)
+        self._start = np.array(start_antennas, dtype=np.float64)
+        self._duration = max(duration, 1e-3)
+
+    @property
+    def duration(self) -> float:
+        return self._duration
+
+    def evaluate(
+        self, t: float
+    ) -> tuple[NDArray[np.float64] | None, NDArray[np.float64] | None, float | None]:
+        alpha = min(1.0, t / self._duration)
+        antennas = (1.0 - alpha) * self._start + alpha * self._target
+        return (None, antennas.astype(np.float64), None)
+
+
 def combine_full_body(primary_pose: FullBodyPose, secondary_pose: FullBodyPose) -> FullBodyPose:
     """Combine primary and secondary full body poses.
 
