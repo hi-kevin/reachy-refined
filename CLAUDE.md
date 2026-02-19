@@ -25,6 +25,8 @@ And the Google API for the model we are using. DO NOT CHANGE THE MODEL. https://
 - Source code lives locally; deploy to robot before testing.
 - For quick ad-hoc tests, SSH directly and run on robot. For permanent code changes, edit locally and deploy via `scripts/deploy.bat`.
 
+Remember, the local system is windows and none of the packages are installed. Run checks for libraries and other source remotely.
+
 ## Deployment Workflow
 
 ```

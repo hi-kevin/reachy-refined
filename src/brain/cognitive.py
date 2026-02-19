@@ -21,6 +21,9 @@ MODEL_ID = "gemini-2.5-flash-native-audio-preview-12-2025"
 AUDIO_SAMPLE_RATE = 16000
 AUDIO_OUT_SAMPLE_RATE = 24000
 
+# Sentinel placed in output_queue to signal end of a turn's audio
+TURN_END = object()
+
 
 class CognitiveBrain:
     """
@@ -349,12 +352,6 @@ class CognitiveBrain:
                         logger.info(f"[RECV] USAGE: prompt={response.usage_metadata.prompt_token_count}, response={response.usage_metadata.response_token_count}")
 
                     if response.server_content:
-                        # Log turn completion clearly
-                        if response.server_content.turn_complete:
-                            logger.info(f"[RECV] TURN COMPLETE")
-                        if response.server_content.interrupted:
-                            logger.info(f"[RECV] INTERRUPTED")
-
                         # Handle Audio
                         model_turn = response.server_content.model_turn
                         if model_turn:
@@ -363,34 +360,30 @@ class CognitiveBrain:
                                     # Audio detected
                                     mime_type = part.inline_data.mime_type
                                     if "audio" in mime_type:
-                                        # Decode
+                                        # Decode raw PCM from Gemini (24kHz int16)
                                         audio_int16 = np.frombuffer(part.inline_data.data, dtype=np.int16)
 
-                                        # Resample 24k -> 16k for robot speaker
-                                        # Convert to float32 for resampling
-                                        audio_float32 = audio_int16.astype(np.float32)
-                                        num_samples = int(len(audio_float32) * AUDIO_SAMPLE_RATE / AUDIO_OUT_SAMPLE_RATE)
-                                        audio_resampled = resample(audio_float32, num_samples)
-                                        # Convert back to int16
-                                        audio_out = audio_resampled.astype(np.int16)
+                                        logger.info(f"[RECV] Audio chunk: {len(audio_int16)} samples at {AUDIO_OUT_SAMPLE_RATE}Hz")
 
-                                        logger.info(f"[RECV] Audio chunk: {len(audio_int16)} -> {len(audio_out)} samples (resampled 24k->16k)")
-
-                                        # Send to output queue with overflow protection
-                                        # If queue is full (or large), drop oldest to keep latency low
-                                        if self.output_queue.qsize() > 10:
-                                            try:
-                                                self.output_queue.get_nowait()
-                                            except asyncio.QueueEmpty:
-                                                pass
-
-                                        await self.output_queue.put((AUDIO_SAMPLE_RATE, audio_out))
+                                        await self.output_queue.put((AUDIO_OUT_SAMPLE_RATE, audio_int16))
                                     else:
                                         logger.info(f"[RECV] Non-audio inline_data: {mime_type}")
                                 elif part.text:
                                     logger.info(f"[RECV] Text: {part.text}")
                                 else:
                                     logger.info(f"[RECV] Unknown part type: {part}")
+
+                        # Signal end-of-turn so play_loop flushes the accumulated buffer.
+                        # generation_complete fires as soon as the model finishes generating
+                        # (turn_complete is delayed waiting for realtime playback to finish).
+                        if response.server_content.generation_complete:
+                            logger.info(f"[RECV] GENERATION COMPLETE — flushing audio")
+                            await self.output_queue.put(TURN_END)
+                        if response.server_content.turn_complete:
+                            logger.info(f"[RECV] TURN COMPLETE")
+                        if response.server_content.interrupted:
+                            logger.info(f"[RECV] INTERRUPTED")
+                            await self.output_queue.put(TURN_END)
 
                     if response.tool_call:
                          for fc in response.tool_call.function_calls:

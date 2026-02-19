@@ -14,6 +14,7 @@ from scipy.signal import resample
 
 from reachy_mini import ReachyMini
 from reachy_mini.media.media_manager import MediaBackend
+from ..brain.cognitive import TURN_END
 
 logger = logging.getLogger(__name__)
 
@@ -163,38 +164,37 @@ class LocalStream:
         logger.debug(f"Audio playback started at {output_sample_rate} Hz")
 
         while not self._stop_event.is_set():
-            # Get audio from brain
             handler_output = await self.handler.emit()
 
-            if handler_output:
+            if handler_output is TURN_END:
+                pass  # sentinel consumed, nothing to do
+
+            elif handler_output is not None:
                 sr, audio_data = handler_output
-                
-                # Reshape if needed (ensure mono/stereo match)
+
+                # Reshape if needed
                 if audio_data.ndim == 2:
-                     # Channels last
                     if audio_data.shape[1] > audio_data.shape[0]:
                         audio_data = audio_data.T
-                    # Mixdown to mono if needed (simple average)
                     if audio_data.shape[1] > 1:
                         audio_data = np.mean(audio_data, axis=1)
 
-                # Ensure float32 for Reachy SDK
-                audio_frame = audio_to_float32(audio_data)
+                # Normalize int16 -> float32 in [-1.0, 1.0]
+                audio_frame = audio_data.astype(np.float32) / 32767.0
 
-                # Resample if needed
+                # Resample to output rate
                 if sr != output_sample_rate:
                     audio_frame = resample(
                         audio_frame,
                         int(len(audio_frame) * output_sample_rate / sr),
                     )
 
-                # Calculate duration to block mic
                 duration = len(audio_frame) / output_sample_rate
-                # Add a small buffer (e.g. 0.1s) for system latency
                 self._playback_end_time = time.time() + duration + 0.1
 
-                # Push to SDK
                 logger.debug(f"Pushing {len(audio_frame)} samples to speaker")
-                self._robot.media.push_audio_sample(audio_frame)
+                # Run in thread to avoid blocking the event loop (GStreamer appsrc can block)
+                await asyncio.to_thread(self._robot.media.push_audio_sample, audio_frame)
 
-            await asyncio.sleep(0.01)
+            else:
+                await asyncio.sleep(0.01)
