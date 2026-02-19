@@ -4,6 +4,14 @@
 
 Reachy Mini conversational robot companion. Identifies people via face recognition, maintains persistent memories per individual, and holds natural conversations using Google Gemini Live API.
 
+## References
+The Reachy SDK: https://github.com/pollen-robotics/reachy_mini
+
+Have a look at this repo for an example of it working: https://github.com/gamepop/reachy-mini-gemini/blob/main/reachy_mini_gemini_app/gemini_handler.py
+
+And the Google API for the model we are using. DO NOT CHANGE THE MODEL. https://docs.cloud.google.com/vertex-ai/generative-ai/docs/reference/rest
+
+
 ## Robot Environment
 
 - **Robot hostname:** `reachy-mini.local`
