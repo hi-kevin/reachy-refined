@@ -328,112 +328,117 @@ class CognitiveBrain:
     async def _receive_loop(self):
         """Receive responses (audio/text) from Gemini."""
         logger.info("[RECV] Receive loop started.")
-        try:
-            async for response in self._session.receive():
-                # --- Log ALL response fields for diagnostics ---
-                if response.voice_activity_detection_signal:
-                    logger.info(f"[RECV] VAD SIGNAL: {response.voice_activity_detection_signal}")
-                if response.voice_activity:
-                    logger.info(f"[RECV] VOICE ACTIVITY: {response.voice_activity}")
-                if response.go_away:
-                    logger.warning(f"[RECV] GO_AWAY: {response.go_away}")
-                if response.session_resumption_update:
-                    logger.info(f"[RECV] SESSION RESUMPTION: {response.session_resumption_update}")
-                if response.setup_complete:
-                    logger.info(f"[RECV] SETUP COMPLETE")
-                if response.usage_metadata:
-                    logger.info(f"[RECV] USAGE: prompt={response.usage_metadata.prompt_token_count}, response={response.usage_metadata.response_token_count}")
+        while self._session_active:
+            try:
+                if not self._session:
+                    break
 
-                if response.server_content:
-                    # Log turn completion clearly
-                    if response.server_content.turn_complete:
-                        logger.info(f"[RECV] TURN COMPLETE")
-                    if response.server_content.interrupted:
-                        logger.info(f"[RECV] INTERRUPTED")
+                async for response in self._session.receive():
+                    # --- Log ALL response fields for diagnostics ---
+                    if response.voice_activity_detection_signal:
+                        logger.info(f"[RECV] VAD SIGNAL: {response.voice_activity_detection_signal}")
+                    if response.voice_activity:
+                        logger.info(f"[RECV] VOICE ACTIVITY: {response.voice_activity}")
+                    if response.go_away:
+                        logger.warning(f"[RECV] GO_AWAY: {response.go_away}")
+                    if response.session_resumption_update:
+                        logger.info(f"[RECV] SESSION RESUMPTION: {response.session_resumption_update}")
+                    if response.setup_complete:
+                        logger.info(f"[RECV] SETUP COMPLETE")
+                    if response.usage_metadata:
+                        logger.info(f"[RECV] USAGE: prompt={response.usage_metadata.prompt_token_count}, response={response.usage_metadata.response_token_count}")
 
-                    # Handle Audio
-                    model_turn = response.server_content.model_turn
-                    if model_turn:
-                        for part in model_turn.parts:
-                            if part.inline_data:
-                                # Audio detected
-                                mime_type = part.inline_data.mime_type
-                                if "audio" in mime_type:
-                                    # Decode
-                                    audio_int16 = np.frombuffer(part.inline_data.data, dtype=np.int16)
+                    if response.server_content:
+                        # Log turn completion clearly
+                        if response.server_content.turn_complete:
+                            logger.info(f"[RECV] TURN COMPLETE")
+                        if response.server_content.interrupted:
+                            logger.info(f"[RECV] INTERRUPTED")
 
-                                    # Resample 24k -> 16k for robot speaker
-                                    # Convert to float32 for resampling
-                                    audio_float32 = audio_int16.astype(np.float32)
-                                    num_samples = int(len(audio_float32) * AUDIO_SAMPLE_RATE / AUDIO_OUT_SAMPLE_RATE)
-                                    audio_resampled = resample(audio_float32, num_samples)
-                                    # Convert back to int16
-                                    audio_out = audio_resampled.astype(np.int16)
+                        # Handle Audio
+                        model_turn = response.server_content.model_turn
+                        if model_turn:
+                            for part in model_turn.parts:
+                                if part.inline_data:
+                                    # Audio detected
+                                    mime_type = part.inline_data.mime_type
+                                    if "audio" in mime_type:
+                                        # Decode
+                                        audio_int16 = np.frombuffer(part.inline_data.data, dtype=np.int16)
 
-                                    logger.info(f"[RECV] Audio chunk: {len(audio_int16)} -> {len(audio_out)} samples (resampled 24k->16k)")
+                                        # Resample 24k -> 16k for robot speaker
+                                        # Convert to float32 for resampling
+                                        audio_float32 = audio_int16.astype(np.float32)
+                                        num_samples = int(len(audio_float32) * AUDIO_SAMPLE_RATE / AUDIO_OUT_SAMPLE_RATE)
+                                        audio_resampled = resample(audio_float32, num_samples)
+                                        # Convert back to int16
+                                        audio_out = audio_resampled.astype(np.int16)
 
-                                    # Send to output queue with overflow protection
-                                    # If queue is full (or large), drop oldest to keep latency low
-                                    if self.output_queue.qsize() > 10:
-                                        try:
-                                            self.output_queue.get_nowait()
-                                        except asyncio.QueueEmpty:
-                                            pass
+                                        logger.info(f"[RECV] Audio chunk: {len(audio_int16)} -> {len(audio_out)} samples (resampled 24k->16k)")
 
-                                    await self.output_queue.put((AUDIO_SAMPLE_RATE, audio_out))
+                                        # Send to output queue with overflow protection
+                                        # If queue is full (or large), drop oldest to keep latency low
+                                        if self.output_queue.qsize() > 10:
+                                            try:
+                                                self.output_queue.get_nowait()
+                                            except asyncio.QueueEmpty:
+                                                pass
+
+                                        await self.output_queue.put((AUDIO_SAMPLE_RATE, audio_out))
+                                    else:
+                                        logger.info(f"[RECV] Non-audio inline_data: {mime_type}")
+                                elif part.text:
+                                    logger.info(f"[RECV] Text: {part.text}")
                                 else:
-                                    logger.info(f"[RECV] Non-audio inline_data: {mime_type}")
-                            elif part.text:
-                                logger.info(f"[RECV] Text: {part.text}")
-                            else:
-                                logger.info(f"[RECV] Unknown part type: {part}")
+                                    logger.info(f"[RECV] Unknown part type: {part}")
 
-                if response.tool_call:
-                     for fc in response.tool_call.function_calls:
-                         logger.info(f"Executing tool: {fc.name}")
-                         result_text = "Tool execution failed."
+                    if response.tool_call:
+                         for fc in response.tool_call.function_calls:
+                             logger.info(f"Executing tool: {fc.name}")
+                             result_text = "Tool execution failed."
 
-                         if fc.name == "analyze_scene":
-                             args = fc.args
-                             question = args.get("question", "What do you see?")
-                             if self.robotics_brain:
-                                 result_text = await self.robotics_brain.capture_and_analyze(question)
-                             else:
-                                 result_text = "Vision unavailable."
+                             if fc.name == "analyze_scene":
+                                 args = fc.args
+                                 question = args.get("question", "What do you see?")
+                                 if self.robotics_brain:
+                                     result_text = await self.robotics_brain.capture_and_analyze(question)
+                                 else:
+                                     result_text = "Vision unavailable."
 
-                         elif fc.name == "remember":
-                             args = fc.args
-                             content = args.get("content", "")
-                             if self.memory_server:
-                                 # Sync call in async loop - technically blocking but sqlite is fast
-                                 result_text = self.memory_server.remember(content)
-                             else:
-                                 result_text = "Memory unavailable."
+                             elif fc.name == "remember":
+                                 args = fc.args
+                                 content = args.get("content", "")
+                                 if self.memory_server:
+                                     # Sync call in async loop - technically blocking but sqlite is fast
+                                     result_text = self.memory_server.remember(content)
+                                 else:
+                                     result_text = "Memory unavailable."
 
-                         elif fc.name == "recall":
-                             args = fc.args
-                             query = args.get("query", "")
-                             if self.memory_server:
-                                 result_text = self.memory_server.recall(query)
-                             else:
-                                 result_text = "Memory unavailable."
+                             elif fc.name == "recall":
+                                 args = fc.args
+                                 query = args.get("query", "")
+                                 if self.memory_server:
+                                     result_text = self.memory_server.recall(query)
+                                 else:
+                                     result_text = "Memory unavailable."
 
-                         # Send result back
-                         await self._session.send(input=types.ToolResponse(
-                             function_responses=[
-                                 types.FunctionResponse(
-                                     name=fc.name,
-                                     response={"result": result_text}
-                                 )
-                             ]
-                         ))
+                             # Send result back
+                             await self._session.send(input=types.ToolResponse(
+                                 function_responses=[
+                                     types.FunctionResponse(
+                                         name=fc.name,
+                                         response={"result": result_text}
+                                     )
+                                 ]
+                             ))
 
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.error(f"Error receiving from Gemini: {e}")
-            # Signal connection loss so _run_session can reconnect
-            self._connection_lost.set()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error receiving from Gemini: {e}")
+                # Signal connection loss so _run_session can reconnect
+                self._connection_lost.set()
+                break
 
         logger.info("[RECV] Receive loop exited.")
 
