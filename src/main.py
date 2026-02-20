@@ -33,6 +33,7 @@ try:
     from src.brain.robotics import RoboticsBrain
     from src.memory.server import MemoryServer
     from src.face_watcher import FaceWatcher
+    from src.robot_mcp_server import RobotMCPServer
 except ImportError:
     # Fallback for running directly from src/
     try:
@@ -42,6 +43,7 @@ except ImportError:
         from brain.robotics import RoboticsBrain
         from memory.server import MemoryServer
         from face_watcher import FaceWatcher
+        from robot_mcp_server import RobotMCPServer
         from reachy_mini import ReachyMini
     except ImportError as e:
         logger.error(f"Import Error: {e}")
@@ -77,6 +79,8 @@ async def main():
     vision = RoboticsBrain(robot=robot)
 
     # 5. Initialize Cognitive Brain (Audio/Reasoning) - inject dependencies
+    #    RobotMCPServer is created after FaceWatcher (needs it for force_sleep),
+    #    so we pass it in after watcher is ready.
     logger.info("Initializing CognitiveBrain (Audio/Reasoning)...")
     brain = CognitiveBrain(robotics_brain=vision, memory_server=memory)
 
@@ -85,6 +89,11 @@ async def main():
     logger.info("Initializing FaceWatcher...")
     watcher = FaceWatcher(robot=robot, movement_manager=moves, brain=brain)
     watcher.start()
+
+    # 6b. Now that FaceWatcher exists, create RobotMCPServer and inject into brain.
+    logger.info("Initializing RobotMCPServer...")
+    robot_mcp = RobotMCPServer(movement_manager=moves, face_watcher=watcher)
+    brain.robot_mcp = robot_mcp
 
     # Wire FaceWatcher as the camera_worker so MovementManager polls
     # get_face_tracking_offsets() every 100 Hz tick.

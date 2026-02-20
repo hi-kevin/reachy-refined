@@ -30,8 +30,8 @@ logger = logging.getLogger(__name__)
 # Timing & detection tunables
 # ---------------------------------------------------------------------------
 POLL_INTERVAL = 0.1          # seconds between camera polls (10 Hz)
-WAKE_WINDOW_SIZE = 8         # sliding window size for wake detection
-WAKE_MIN_FRAMES = 3          # min detections within window to wake
+WAKE_WINDOW_SIZE = 10         # sliding window size for wake detection
+WAKE_MIN_FRAMES = 2          # min detections within window to wake
 SLEEP_TIMEOUT_S = 15.0       # seconds without a face before going back to sleep
 
 # Haar cascade parameters
@@ -131,6 +131,20 @@ class FaceWatcher:
     def awake(self) -> bool:
         with self._lock:
             return self._awake
+
+    def force_sleep(self) -> None:
+        """Immediately transition to SLEEPING, bypassing the face-timeout.
+
+        Safe to call from any thread (e.g. from a Gemini tool callback).
+        The state-machine loop checks ``_awake`` under the lock, so the
+        transition will be clean even if the loop is mid-tick.
+        """
+        with self._lock:
+            if not self._awake:
+                logger.info("FaceWatcher.force_sleep: already sleeping, no-op.")
+                return
+        logger.info("FaceWatcher.force_sleep: forcing AWAKE → SLEEPING transition.")
+        self._enter_sleep()
 
     def get_face_tracking_offsets(self) -> tuple:
         """Return a 6-DOF secondary offset tuple for MovementManager.
