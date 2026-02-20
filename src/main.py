@@ -63,6 +63,7 @@ async def main():
     robot = ReachyMini()
 
     # 2. Initialize Movement Manager (Controls head/antennas)
+    #    camera_worker is set after FaceWatcher is created (see below).
     logger.info("Initializing MovementManager...")
     moves = MovementManager(robot)
     moves.start()
@@ -79,10 +80,15 @@ async def main():
     logger.info("Initializing CognitiveBrain (Audio/Reasoning)...")
     brain = CognitiveBrain(robotics_brain=vision, memory_server=memory)
 
-    # 6. Start Face Watcher - gates mic and drives antenna state
+    # 6. Start Face Watcher - gates mic, drives antenna state, and supplies
+    #    face-tracking yaw offsets to MovementManager while awake.
     logger.info("Initializing FaceWatcher...")
     watcher = FaceWatcher(robot=robot, movement_manager=moves, brain=brain)
     watcher.start()
+
+    # Wire FaceWatcher as the camera_worker so MovementManager polls
+    # get_face_tracking_offsets() every 100 Hz tick.
+    moves.camera_worker = watcher
 
     # 7. Initialize Audio Stream - connect to brain, gated by face watcher
     logger.info("Initializing LocalStream...")

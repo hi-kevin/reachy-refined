@@ -30,19 +30,32 @@ logger = logging.getLogger(__name__)
 # Timing & detection tunables
 # ---------------------------------------------------------------------------
 POLL_INTERVAL = 0.1          # seconds between camera polls (10 Hz)
-WAKE_WINDOW_SIZE = 5         # sliding window size for wake detection
+WAKE_WINDOW_SIZE = 8         # sliding window size for wake detection
 WAKE_MIN_FRAMES = 3          # min detections within window to wake
 SLEEP_TIMEOUT_S = 15.0       # seconds without a face before going back to sleep
 
 # Haar cascade parameters
 SCALE_FACTOR = 1.1
 MIN_NEIGHBORS = 5
-MIN_FACE_SIZE = (50, 50)
+MIN_FACE_SIZE = (40, 40)
 
 # Antenna positions (radians)
-ANTENNA_UP = np.deg2rad(45.0)
-ANTENNA_DOWN = np.deg2rad(-45.0)
-ANTENNA_MOVE_DURATION = 0.6
+ANTENNA_UP = np.deg2rad(90.0)
+ANTENNA_DOWN = np.deg2rad(-90.0)
+ANTENNA_MOVE_DURATION = 1.1
+
+# ---------------------------------------------------------------------------
+# Person tracking tunables
+# ---------------------------------------------------------------------------
+# Proportional gain: how many radians of body yaw per unit of normalised
+# horizontal face offset (offset ranges -0.5 … +0.5 across the frame).
+# Larger = more aggressive tracking.
+TRACK_YAW_GAIN = 0.8
+# Dead-zone: ignore offsets smaller than this (normalised units) to avoid
+# jitter when the face is roughly centred.
+TRACK_DEAD_ZONE = 0.05
+# Low-pass smoothing for the yaw offset (0 = no smoothing, 1 = frozen).
+TRACK_SMOOTHING = 0.7
 
 
 class FaceWatcher:
@@ -67,6 +80,10 @@ class FaceWatcher:
 
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+
+        # Person tracking — smoothed yaw offset fed to MovementManager
+        self._track_yaw: float = 0.0       # smoothed body-yaw correction (radians)
+        self._track_lock = threading.Lock()
 
         # Debug stats — logged once per second
         self._stats_time: float = 0.0
@@ -114,6 +131,17 @@ class FaceWatcher:
     def awake(self) -> bool:
         with self._lock:
             return self._awake
+
+    def get_face_tracking_offsets(self) -> tuple:
+        """Return a 6-DOF secondary offset tuple for MovementManager.
+
+        Only yaw (index 5) is populated — a proportional correction that
+        rotates the body toward the detected face.  All other DOF are zero
+        so this doesn't interfere with head pitch/roll or speech sway.
+        """
+        with self._track_lock:
+            yaw = self._track_yaw
+        return (0.0, 0.0, 0.0, 0.0, 0.0, yaw)
 
     # ------------------------------------------------------------------
     # Main loop
@@ -233,7 +261,12 @@ class FaceWatcher:
     # ------------------------------------------------------------------
 
     def _detect_face(self) -> bool:
-        """Grab a frame from the robot camera and run Haar face detection."""
+        """Grab a frame from the robot camera and run Haar face detection.
+
+        While awake, also computes a smoothed body-yaw correction from the
+        largest detected face's horizontal position and stores it so
+        get_face_tracking_offsets() can supply it to MovementManager.
+        """
         if self._detector.empty():
             return False
 
@@ -262,17 +295,41 @@ class FaceWatcher:
         if found:
             self._stats_detections += 1
 
-        # Conditional logging based on state vs detection
         is_awake = self.awake
+
+        # --- Person tracking (only while awake) ---
+        if is_awake:
+            if found:
+                # Pick the largest face
+                x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+                frame_w = frame.shape[1]
+                # Normalised horizontal offset: -0.5 (left) … +0.5 (right)
+                norm_offset = (x + w / 2.0) / frame_w - 0.5
+                if abs(norm_offset) < TRACK_DEAD_ZONE:
+                    norm_offset = 0.0
+                raw_yaw = norm_offset * TRACK_YAW_GAIN
+                with self._track_lock:
+                    self._track_yaw = (
+                        TRACK_SMOOTHING * self._track_yaw
+                        + (1.0 - TRACK_SMOOTHING) * raw_yaw
+                    )
+            else:
+                # Decay toward zero when face is lost
+                with self._track_lock:
+                    self._track_yaw *= TRACK_SMOOTHING
+        else:
+            # Sleeping — zero out tracking so it doesn't linger on wake
+            with self._track_lock:
+                self._track_yaw = 0.0
+
+        # Conditional logging
         if not is_awake and found:
-            # Asleep but saw a face -> log it
             sizes = [f"{w}x{h}" for (_, _, w, h) in faces]
             logger.debug(
                 "[FaceWatcher] ASLEEP detected %d face(s): %s frame=%dx%d",
                 len(faces), ", ".join(sizes), frame.shape[1], frame.shape[0],
             )
         elif is_awake and not found:
-            # Awake but lost face -> log it
             logger.debug("[FaceWatcher] AWAKE but no faces in view.")
 
         return found

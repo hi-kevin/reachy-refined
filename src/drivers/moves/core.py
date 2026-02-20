@@ -14,13 +14,21 @@ from reachy_mini.utils import create_head_pose
 from reachy_mini.motion.move import Move
 
 from .types import FullBodyPose, MovementState, LoopFrequencyStats
-from .primitives import BreathingMove, combine_full_body, clone_full_body_pose
+from .primitives import BreathingMove, ScanRotationMove, combine_full_body, clone_full_body_pose
 
 if TYPE_CHECKING:
     from reachy_mini import ReachyMini
 
 logger = logging.getLogger(__name__)
 CONTROL_LOOP_FREQUENCY_HZ = 100.0
+
+# Sleep-mode base scanning.
+# The body yaw is limited to ±160° by the hardware.  We sweep through a
+# sequence of positions that stay comfortably within that range.
+# Pattern: 30° at a time, left then right and repeat
+SCAN_ANGLES_RAD = [np.deg2rad(a) for a in [0, 30, 60, 90, 120, 150, 120, 90, 60, 30, 0, -30, -60, -90, -120, -150, -120, -90, -60, -30]]
+SCAN_ROTATE_DURATION = 4.0   # seconds to rotate between scan positions
+SCAN_HOLD_DURATION = 4.0     # seconds to hold at each scan position
 
 class MovementManager:
     """Coordinate sequential moves, additive offsets, and robot output at 100 Hz."""
@@ -61,6 +69,8 @@ class MovementManager:
         self._last_listening_blend_time = self._now()
         self._breathing_active = False  # true when breathing move is running or queued
         self._sleeping = True  # when True, breathing is suppressed (robot is idle / no face)
+        self._scan_index = 0   # current position index in SCAN_ANGLES_RAD
+        self._scan_yaw = 0.0   # body_yaw of the last queued scan target
         self._listening_debounce_s = 0.15
         self._last_listening_toggle_time = self._now()
         self._last_set_target_err = 0.0
@@ -223,9 +233,15 @@ class MovementManager:
                 self.state.current_move = None
                 self.state.move_start_time = None
                 self._breathing_active = False
+                self._scan_index = 0
+                self._scan_yaw = 0.0
                 logger.info("MovementManager: entering SLEEP mode — breathing suppressed")
             elif not self._sleeping and was_sleeping:
                 logger.info("MovementManager: entering AWAKE mode — breathing enabled")
+                # Stay at current scan yaw — the robot just found someone so it
+                # should remain pointing in that direction; face tracking takes over.
+                self._scan_index = 0
+                self._scan_yaw = 0.0
                 self.state.update_activity()  # restart idle timer for breathing
         elif command == "set_listening":
             desired_state = bool(payload)
@@ -315,6 +331,30 @@ class MovementManager:
         if self.state.current_move is not None and not isinstance(self.state.current_move, BreathingMove):
             self._breathing_active = False
 
+    def _manage_sleep_scanning(self) -> None:
+        """Queue the next scan rotation move when sleeping and idle."""
+        if not self._sleeping:
+            return
+        if self.state.current_move is not None or self.move_queue:
+            return
+        # Advance to the next scan position
+        next_index = (self._scan_index + 1) % len(SCAN_ANGLES_RAD)
+        target_yaw = SCAN_ANGLES_RAD[next_index]
+        move = ScanRotationMove(
+            start_yaw=self._scan_yaw,
+            target_yaw=target_yaw,
+            rotate_duration=SCAN_ROTATE_DURATION,
+            hold_duration=SCAN_HOLD_DURATION,
+        )
+        self.move_queue.append(move)
+        self._scan_index = next_index
+        self._scan_yaw = target_yaw
+        logger.debug(
+            "Sleep scan: rotating to %.1f° (step %d)",
+            np.rad2deg(target_yaw),
+            next_index,
+        )
+
     def _get_primary_pose(self, current_time: float) -> FullBodyPose:
         """Get the primary full body pose from current move or neutral."""
         # When a primary move is playing, sample it and cache the resulting pose
@@ -322,12 +362,15 @@ class MovementManager:
             move_time = current_time - self.state.move_start_time
             head, antennas, body_yaw = self.state.current_move.evaluate(move_time)
 
+            # For partial moves (e.g. ScanRotationMove only sets body_yaw),
+            # fall back to the last cached primary pose rather than snapping to neutral.
+            last = self.state.last_primary_pose
             if head is None:
-                head = create_head_pose(0, 0, 0, 0, 0, 0, degrees=True)
+                head = last[0].copy() if last is not None else create_head_pose(0, 0, 0, 0, 0, 0, degrees=True)
             if antennas is None:
-                antennas = np.array([0.0, 0.0])
+                antennas = np.array(last[1]) if last is not None else np.array([0.0, 0.0])
             if body_yaw is None:
-                body_yaw = 0.0
+                body_yaw = last[2] if last is not None else 0.0
 
             antennas_tuple = (float(antennas[0]), float(antennas[1]))
             head_copy = head.copy()
@@ -382,6 +425,7 @@ class MovementManager:
         """Advance queue state and idle behaviours for this tick."""
         self._manage_move_queue(current_time)
         self._manage_breathing(current_time)
+        self._manage_sleep_scanning()
 
     def _calculate_blended_antennas(self, target_antennas: Tuple[float, float]) -> Tuple[float, float]:
         """Blend target antennas with listening freeze state and update blending."""
