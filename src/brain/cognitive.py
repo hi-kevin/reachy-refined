@@ -3,7 +3,7 @@ import logging
 import os
 import time
 import traceback
-from typing import Optional, Tuple, AsyncGenerator, List, Dict, Any
+from typing import Optional, Tuple, AsyncGenerator, List, Dict, Any, TYPE_CHECKING
 import numpy as np
 from scipy.signal import resample
 
@@ -13,6 +13,7 @@ from google.genai import types
 # Import RoboticsBrain protocol or class
 from .robotics import RoboticsBrain
 from ..memory.server import MemoryServer
+from ..robot_mcp_server import RobotMCPServer, TOOL_DECLARATIONS as ROBOT_TOOL_DECLARATIONS
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +36,7 @@ class CognitiveBrain:
       sleep() → tears down the session (Gemini goes stale after long silence)
     """
 
-    def __init__(self, robotics_brain: Optional[RoboticsBrain] = None, memory_server: Optional[MemoryServer] = None, api_key: Optional[str] = None):
+    def __init__(self, robotics_brain: Optional[RoboticsBrain] = None, memory_server: Optional[MemoryServer] = None, api_key: Optional[str] = None, robot_mcp: Optional[RobotMCPServer] = None):
         self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
         if not self.api_key:
             logger.error("GOOGLE_API_KEY not found.")
@@ -60,6 +61,7 @@ class CognitiveBrain:
         # Injected brains
         self.robotics_brain = robotics_brain
         self.memory_server = memory_server
+        self.robot_mcp = robot_mcp
 
     # ------------------------------------------------------------------
     # Public wake/sleep API (called from FaceWatcher transitions)
@@ -114,52 +116,84 @@ class CognitiveBrain:
         MAX_RETRIES = 5
         retry_count = 0
 
-        # Tool definitions
-        analyze_scene_tool = types.Tool(
-            function_declarations=[
-                types.FunctionDeclaration(
-                    name="analyze_scene",
-                    description="Analyze the current visual scene to identify objects, people, or layout.",
-                    parameters=types.Schema(
-                        type="OBJECT",
-                        properties={
-                            "question": types.Schema(
-                                type="STRING",
-                                description="Specific question about what to look for."
-                            )
-                        },
-                        required=["question"]
-                    )
-                ),
-                types.FunctionDeclaration(
-                    name="remember",
-                    description="Store a piece of information in long-term memory.",
-                    parameters=types.Schema(
-                        type="OBJECT",
-                        properties={
-                            "content": types.Schema(
-                                type="STRING",
-                                description="The information to remember."
-                            )
-                        },
-                        required=["content"]
-                    )
-                ),
-                types.FunctionDeclaration(
-                    name="recall",
-                    description="Search long-term memory for relevant information.",
-                    parameters=types.Schema(
-                        type="OBJECT",
-                        properties={
-                            "query": types.Schema(
-                                type="STRING",
-                                description="Search query."
-                            )
-                        },
-                        required=["query"]
-                    )
+        # Tool definitions — built dynamically so new robot tools are
+        # picked up automatically from ROBOT_TOOL_DECLARATIONS.
+        _TYPE_MAP = {"STRING": "STRING", "NUMBER": "NUMBER", "INTEGER": "INTEGER", "BOOLEAN": "BOOLEAN"}
+
+        def _build_schema(params: Dict[str, Any], required: List[str]) -> types.Schema:
+            """Convert a ROBOT_TOOL_DECLARATIONS parameter dict into a types.Schema."""
+            if not params:
+                return types.Schema(type="OBJECT", properties={})
+            props = {}
+            for name, spec in params.items():
+                props[name] = types.Schema(
+                    type=_TYPE_MAP.get(spec.get("type", "STRING"), "STRING"),
+                    description=spec.get("description", ""),
                 )
-            ]
+            return types.Schema(type="OBJECT", properties=props, required=required)
+
+        builtin_declarations = [
+            types.FunctionDeclaration(
+                name="analyze_scene",
+                description="Analyze the current visual scene to identify objects, people, or layout.",
+                parameters=types.Schema(
+                    type="OBJECT",
+                    properties={
+                        "question": types.Schema(
+                            type="STRING",
+                            description="Specific question about what to look for."
+                        )
+                    },
+                    required=["question"]
+                )
+            ),
+            types.FunctionDeclaration(
+                name="remember",
+                description="Store a piece of information in long-term memory.",
+                parameters=types.Schema(
+                    type="OBJECT",
+                    properties={
+                        "content": types.Schema(
+                            type="STRING",
+                            description="The information to remember."
+                        )
+                    },
+                    required=["content"]
+                )
+            ),
+            types.FunctionDeclaration(
+                name="recall",
+                description="Search long-term memory for relevant information.",
+                parameters=types.Schema(
+                    type="OBJECT",
+                    properties={
+                        "query": types.Schema(
+                            type="STRING",
+                            description="Search query."
+                        )
+                    },
+                    required=["query"]
+                )
+            ),
+        ]
+
+        robot_declarations = [
+            types.FunctionDeclaration(
+                name=decl["name"],
+                description=decl["description"],
+                parameters=_build_schema(
+                    decl.get("parameters", {}),
+                    decl.get("required", []),
+                ),
+            )
+            for decl in ROBOT_TOOL_DECLARATIONS
+        ]
+
+        all_tool = types.Tool(function_declarations=builtin_declarations + robot_declarations)
+        logger.info(
+            "Registered %d built-in + %d robot tools with Gemini.",
+            len(builtin_declarations),
+            len(robot_declarations),
         )
 
         system_instr = """You are Reachy, a robot companion.
@@ -178,7 +212,7 @@ class CognitiveBrain:
                     )
                 )
             ),
-            tools=[analyze_scene_tool],
+            tools=[all_tool],
             system_instruction=types.Content(
                 parts=[types.Part(text=system_instr)]
             ),
@@ -414,6 +448,13 @@ class CognitiveBrain:
                                      result_text = self.memory_server.recall(query)
                                  else:
                                      result_text = "Memory unavailable."
+
+                             elif self.robot_mcp is not None:
+                                 # Route all other tool calls through the robot MCP server
+                                 result_text = await self.robot_mcp.dispatch(fc.name, dict(fc.args or {}))
+
+                             else:
+                                 result_text = f"No handler for tool: {fc.name}"
 
                              # Send result back
                              await self._session.send(input=types.ToolResponse(

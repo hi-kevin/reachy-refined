@@ -24,6 +24,7 @@ And the Google API for the model we are using. DO NOT CHANGE THE MODEL. https://
 - **Never run Python locally.** All Python must run on the robot via SSH.
 - Source code lives locally; deploy to robot before testing.
 - For quick ad-hoc tests, SSH directly and run on robot. For permanent code changes, edit locally and deploy via `scripts/deploy.bat`.
+- **NEVER run `pkill -f python`, `pkill python`, or any broad process kill on the robot.** The robot OS runs critical system Python processes (camera pipeline, motor controller, GStreamer daemons, etc.). Killing them crashes the robot and requires a physical reboot. To stop only the app, always use `scripts/kill_remote.bat` (which runs `pkill -f 'src.main'`) or the deploy script.
 
 Remember, the local system is windows and none of the packages are installed. Run checks for libraries and other source remotely.
 

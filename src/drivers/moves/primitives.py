@@ -159,6 +159,86 @@ class AntennaMove(Move):
         return (None, antennas.astype(np.float64), None)
 
 
+class ScanRotationMove(Move):
+    """Robotic scan move: head snaps first, then the body catches up.
+
+    Three phases:
+      1. HEAD SNAP  (head_snap_duration):
+         Head quickly rotates in world frame to face target_yaw direction.
+         Body stays at start_yaw.  Looks like the robot is "looking" somewhere.
+
+      2. BODY CATCH-UP  (rotate_duration):
+         Body slowly rotates from start_yaw to target_yaw.
+         Head pose is held constant in world frame (= facing target_yaw),
+         so the IK naturally keeps the camera locked on that world direction
+         while the body swings underneath.
+
+      3. HOLD  (hold_duration):
+         Both head and body hold at target_yaw.
+
+    The head pose is always expressed in the world frame (as the SDK expects).
+    """
+
+    HEAD_SNAP_DURATION = 0.25   # seconds for the quick head snap
+
+    def __init__(
+        self,
+        start_yaw: float,
+        target_yaw: float,
+        rotate_duration: float,
+        hold_duration: float = 0.0,
+    ) -> None:
+        self._start_yaw = float(start_yaw)
+        self._target_yaw = float(target_yaw)
+        self._snap_duration = self.HEAD_SNAP_DURATION
+        self._rotate_duration = max(float(rotate_duration), 1e-3)
+        self._hold_duration = max(float(hold_duration), 0.0)
+
+        # Pre-compute the two world-frame head poses
+        self._head_at_start = self._head_pose_for_yaw(self._start_yaw)
+        self._head_at_target = self._head_pose_for_yaw(self._target_yaw)
+
+    @staticmethod
+    def _head_pose_for_yaw(yaw: float) -> NDArray[np.float64]:
+        """World-frame head pose facing in the given yaw direction (Rz(yaw))."""
+        c, s = np.cos(yaw), np.sin(yaw)
+        pose = np.eye(4, dtype=np.float64)
+        pose[0, 0] = c;  pose[0, 1] = -s
+        pose[1, 0] = s;  pose[1, 1] = c
+        return pose
+
+    @property
+    def duration(self) -> float:
+        return self._snap_duration + self._rotate_duration + self._hold_duration
+
+    def evaluate(
+        self, t: float
+    ) -> tuple[NDArray[np.float64] | None, NDArray[np.float64] | None, float | None]:
+        t_rotate_start = self._snap_duration
+        t_hold_start   = self._snap_duration + self._rotate_duration
+
+        if t < t_rotate_start:
+            # Phase 1: head snaps quickly to target direction; body stays put
+            alpha = t / self._snap_duration
+            head_pose = linear_pose_interpolation(
+                self._head_at_start, self._head_at_target, alpha
+            )
+            body_yaw = self._start_yaw
+
+        elif t < t_hold_start:
+            # Phase 2: head locked on target world direction; body rotates to catch up
+            alpha = (t - t_rotate_start) / self._rotate_duration
+            body_yaw = self._start_yaw + alpha * (self._target_yaw - self._start_yaw)
+            head_pose = self._head_at_target.copy()
+
+        else:
+            # Phase 3: hold — both at target
+            body_yaw = self._target_yaw
+            head_pose = self._head_at_target.copy()
+
+        return (head_pose, None, float(body_yaw))
+
+
 def combine_full_body(primary_pose: FullBodyPose, secondary_pose: FullBodyPose) -> FullBodyPose:
     """Combine primary and secondary full body poses.
 

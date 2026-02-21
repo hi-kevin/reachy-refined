@@ -5,7 +5,9 @@
       "Bash(ssh:*)",
       "WebFetch(domain:raw.githubusercontent.com)",
       "Bash(curl:*)",
-      "Bash(cmd /c:*)"
+      "Bash(cmd /c:*)",
+      "Bash(powershell -Command:*)",
+      "Bash(echo:*)"
     ]
   }
 }
