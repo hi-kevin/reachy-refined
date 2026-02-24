@@ -19,10 +19,7 @@ logger = logging.getLogger("ReachyGemini")
 logging.getLogger("websockets").setLevel(logging.WARNING)
 logging.getLogger("websockets.client").setLevel(logging.WARNING)
 
-# Imports
 # Add project root to sys.path to allow imports from src
-import sys
-import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 try:
@@ -32,7 +29,9 @@ try:
     from src.brain.cognitive import CognitiveBrain
     from src.brain.robotics import RoboticsBrain
     from src.memory.server import MemoryServer
+    from src.memory.consolidator import MemoryConsolidator
     from src.face_watcher import FaceWatcher
+    from src.face_identifier import FaceIdentifier
     from src.robot_mcp_server import RobotMCPServer
 except ImportError:
     # Fallback for running directly from src/
@@ -42,7 +41,9 @@ except ImportError:
         from brain.cognitive import CognitiveBrain
         from brain.robotics import RoboticsBrain
         from memory.server import MemoryServer
+        from memory.consolidator import MemoryConsolidator
         from face_watcher import FaceWatcher
+        from face_identifier import FaceIdentifier
         from robot_mcp_server import RobotMCPServer
         from reachy_mini import ReachyMini
     except ImportError as e:
@@ -54,9 +55,11 @@ stream = None
 brain = None
 moves = None
 watcher = None
+consolidator = None
+
 
 async def main():
-    global robot, stream, brain, moves, watcher
+    global robot, stream, brain, moves, watcher, consolidator
 
     logger.info("--- Reachy Gemini Refactor Starting ---")
 
@@ -64,50 +67,75 @@ async def main():
     logger.info("Initializing ReachyMini...")
     robot = ReachyMini()
 
-    # 2. Initialize Movement Manager (Controls head/antennas)
-    #    camera_worker is set after FaceWatcher is created (see below).
+    # 2. Initialize Movement Manager
     logger.info("Initializing MovementManager...")
     moves = MovementManager(robot)
     moves.start()
+
+    # 2b. Initialize FaceIdentifier (LBPH)
+    logger.info("Initializing FaceIdentifier...")
+    identifier = FaceIdentifier()
+    logger.info(
+        "FaceIdentifier ready — known people: %s",
+        identifier.known_people or "(none yet)",
+    )
 
     # 3. Initialize Memory Server
     logger.info("Initializing MemoryServer...")
     memory = MemoryServer(db_path="memories.db")
 
-    # 4. Initialize Robotics Brain (Vision) - inject robot for camera access
+    # 3b. Initialize Memory Consolidator (daily LLM job, 2 AM)
+    logger.info("Initializing MemoryConsolidator...")
+    consolidator = MemoryConsolidator(memory_server=memory)
+    consolidator.schedule()
+
+    # 4. Initialize Robotics Brain (Vision)
     logger.info("Initializing RoboticsBrain (Vision)...")
     vision = RoboticsBrain(robot=robot)
 
-    # 5. Initialize Cognitive Brain (Audio/Reasoning) - inject dependencies
-    #    RobotMCPServer is created after FaceWatcher (needs it for force_sleep),
-    #    so we pass it in after watcher is ready.
+    # 5. Initialize Cognitive Brain (Audio/Reasoning)
+    #    robot_mcp injected after FaceWatcher is ready (step 6b)
     logger.info("Initializing CognitiveBrain (Audio/Reasoning)...")
     brain = CognitiveBrain(robotics_brain=vision, memory_server=memory)
 
-    # 6. Start Face Watcher - gates mic, drives antenna state, and supplies
-    #    face-tracking yaw offsets to MovementManager while awake.
+    # 6. Initialize FaceWatcher with identity and memory support
     logger.info("Initializing FaceWatcher...")
-    watcher = FaceWatcher(robot=robot, movement_manager=moves, brain=brain)
+    watcher = FaceWatcher(
+        robot=robot,
+        movement_manager=moves,
+        brain=brain,
+        face_identifier=identifier,
+        memory_server=memory,
+    )
     watcher.start()
 
-    # 6b. Now that FaceWatcher exists, create RobotMCPServer and inject into brain.
-    logger.info("Initializing RobotMCPServer...")
-    robot_mcp = RobotMCPServer(movement_manager=moves, face_watcher=watcher)
-    brain.robot_mcp = robot_mcp
+    # Pass the running event loop to FaceWatcher so it can fire async callbacks
+    # (identify_unknown_face, set_active_person injection) from its thread.
+    loop = asyncio.get_event_loop()
+    watcher._event_loop = loop
 
-    # Wire FaceWatcher as the camera_worker so MovementManager polls
-    # get_face_tracking_offsets() every 100 Hz tick.
+    # Wire FaceWatcher as the camera_worker for 100Hz face-tracking offsets
     moves.camera_worker = watcher
 
-    # 7. Initialize Audio Stream - connect to brain, gated by face watcher
+    # 6b. Create RobotMCPServer and inject into brain
+    logger.info("Initializing RobotMCPServer...")
+    robot_mcp = RobotMCPServer(
+        movement_manager=moves,
+        face_watcher=watcher,
+        face_identifier=identifier,
+        memory_server=memory,
+    )
+    brain.robot_mcp = robot_mcp
+
+    # 7. Initialize Audio Stream
     logger.info("Initializing LocalStream...")
     stream = LocalStream(handler=brain, robot=robot, face_watcher=watcher)
 
-    # 8. Launch Audio Stream (mic hardware always running; gating is in record_loop)
+    # 8. Launch Audio Stream
     logger.info("Launching Audio Stream...")
     stream.launch()
 
-    # 9. Start Brain Loop (Blocks until shutdown)
+    # 9. Start Brain Loop (blocks until shutdown)
     logger.info("Starting Brain Loop (Gemini Live)...")
     try:
         await brain.start_up()
@@ -117,6 +145,7 @@ async def main():
         logger.error(f"Brain Loop Error: {e}")
     finally:
         logger.info("Shutting down...")
+
 
 async def shutdown(sig, loop):
     logger.info(f"Received exit signal {sig.name}...")
@@ -136,27 +165,31 @@ async def shutdown(sig, loop):
     if moves:
         logger.info("Stopping movement manager...")
         moves.stop()
-        
+
+    if consolidator:
+        logger.info("Stopping memory consolidator...")
+        consolidator.stop()
+
     tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
     [task.cancel() for task in tasks]
     await asyncio.gather(*tasks, return_exceptions=True)
     loop.stop()
 
+
 if __name__ == "__main__":
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    
+
     # Signal handling (Skip on Windows Proactor)
     if os.name == 'nt':
-        # Windows Proactor doesn't support add_signal_handler
-        # We'll rely on KeyboardInterrupt for basic stopping
         pass
     else:
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
-                loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(shutdown(s, loop)))
+                loop.add_signal_handler(
+                    sig, lambda s=sig: asyncio.create_task(shutdown(s, loop))
+                )
             except NotImplementedError:
-                # Fallback if loop doesn't support it
                 pass
 
     try:

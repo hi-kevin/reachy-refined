@@ -30,6 +30,10 @@ Remember, the local system is windows and none of the packages are installed. Ru
 
 ## Deployment Workflow
 
+**The user handles all deployment and final testing.** Do not attempt to run `deploy.bat` or `deploy_and_run.bat` — these are for the user to run locally on Windows.
+
+You may SSH into the robot to inspect files, check imports, run one-off Python checks, or read logs.
+
 ```
 scripts/deploy.bat          # Deploy src/ to robot (kills running process, syncs files, checks encoding)
 scripts/deploy_and_run.bat  # Deploy and immediately start the app
@@ -43,7 +47,7 @@ scripts/setup_remote.bat    # One-time: create venv and install dependencies on 
 3. `scp -r src/`, `.env`, `requirements.txt`, `scripts/check_encoding.py` to robot
 4. Runs encoding check on remote
 
-To run a command on the robot:
+To run a command on the robot (for checks/inspection only):
 ```
 ssh pollen@reachy-mini.local "cd ~/reachy-refined && source .venv/bin/activate && <command>"
 ```
@@ -65,21 +69,27 @@ src/
 │       ├── primitives.py    # Movement primitives
 │       └── types.py         # Type definitions
 ├── memory/
-│   └── server.py            # SQLite FTS5 memory store (remember/recall/get_recent)
-├── memory_server.py         # FastMCP tool wrappers for memory
+│   ├── server.py            # SQLite person-aware memory store (ST/LT per person)
+│   └── consolidator.py      # Daily 2 AM job: consolidates ST → LT via Gemini
+├── face_identifier.py       # LBPH face detection/recognition (subdirectory per person)
+├── face_watcher.py          # Camera loop: AWAKE/SLEEPING state machine, identity tracking
+├── robot_mcp_server.py      # Robot movement + identity/memory tools exposed to Gemini
 ├── audio.py                 # AudioSystem: pyttsx3 TTS + PyAudio wrapper
-├── robot.py                 # ReachyMini SDK abstraction layer
-└── vision.py                # OpenCV LBPH face detection and recognition
+└── robot.py                 # ReachyMini SDK abstraction layer
 ```
 
 **Startup sequence in `main.py`:**
 1. `ReachyMini()` — robot SDK
 2. `MovementManager(robot)` — start 100Hz control loop
-3. `MemoryServer(db_path="memories.db")` — SQLite FTS
-4. `RoboticsBrain(robot=robot)` — vision
-5. `CognitiveBrain(robotics_brain, memory_server)` — Gemini Live
-6. `LocalStream(handler=brain, robot=robot)` — audio bridge
-7. `brain.start_up()` — blocks, runs Gemini Live session
+3. `FaceIdentifier()` — load LBPH model
+4. `MemoryServer(db_path="memories.db")` — SQLite person-aware store
+5. `MemoryConsolidator(memory, api_key).schedule()` — start daily 2 AM consolidation thread
+6. `RoboticsBrain(robot=robot)` — Gemini vision
+7. `CognitiveBrain(robotics_brain, memory_server)` — Gemini Live
+8. `FaceWatcher(robot, moves, brain, identifier, memory)` — camera loop
+9. `RobotMCPServer(moves, face_watcher, identifier, memory)` — tool server
+10. `LocalStream(handler=brain, robot=robot)` — audio bridge
+11. `brain.start_up()` — blocks, runs Gemini Live session
 
 ## Key Components
 
@@ -87,8 +97,9 @@ src/
 - Model: `gemini-2.5-flash-native-audio-preview-12-2025`
 - API version: `v1beta`
 - Audio: 16kHz in (mic), 24kHz out (Gemini) → resampled to 16kHz for robot speaker
-- Tools exposed to Gemini: `analyze_scene`, `remember`, `recall`
-- Async send/receive loops; output queue drops oldest frames if >10 queued
+- Tools exposed to Gemini: `analyze_scene`, `remember`, `recall`, `register_me`, `get_memories_for_me` + all robot movement tools
+- Person context injected into system prompt at session start; updateable mid-session
+- Async send/receive loops
 
 ### MovementManager (`src/drivers/moves/core.py`)
 - Runs in background thread at 100Hz
@@ -97,10 +108,17 @@ src/
 - Idle breathing behavior when inactive
 
 ### MemoryServer (`src/memory/server.py`)
-- SQLite with FTS5 virtual table
-- `remember(text)` — stores with timestamp
-- `recall(query)` — FTS MATCH search
-- `get_recent(limit)` — chronological retrieval
+- SQLite with FTS5 (`memories_search` virtual table)
+- Per-person schema: `people`, `sessions`, `short_term_memories`, `long_term_memories`
+- `remember_for(person_id, session_id, content)` — store ST memory
+- `recall_for(person_id, query)` — FTS search scoped to person (ST + LT)
+- `get_person_context(person_id)` — build context string for system prompt injection
+
+### FaceWatcher (`src/face_watcher.py`)
+- Camera loop with AWAKE/SLEEPING state machine (15s timeout)
+- LBPH identification every 3s; Gemini vision fallback (30s cooldown) for unknowns
+- Calls `brain.set_active_person()` when identity confirmed
+- `force_sleep()` — immediate sleep bypass (used by `go_to_sleep` tool)
 
 ### LocalStream (`src/drivers/local_stream.py`)
 - Record loop: captures mic → forwards to `brain.receive()`
@@ -141,18 +159,18 @@ opencv-contrib-python
 
 ## Common Operations
 
-**Deploy and test:**
+**Deploy and run (user runs these):**
 ```
 scripts\deploy.bat
-ssh pollen@reachy-mini.local "cd ~/reachy-refined && source .venv/bin/activate && python -m src.main"
+scripts\deploy_and_run.bat
 ```
 
-**Check logs / run one-off script on robot:**
+**Inspect / verify on robot (Claude can SSH for these):**
 ```
 ssh pollen@reachy-mini.local "cd ~/reachy-refined && source .venv/bin/activate && python -c '<code>'"
 ```
 
-**Kill the running app:**
+**Kill the running app (user runs this):**
 ```
 scripts\kill_remote.bat
 ```
