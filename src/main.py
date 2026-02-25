@@ -15,6 +15,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ReachyGemini")
 
+# Attach log capture ring-buffer (used by MonitorServer /log endpoint).
+# Must be created after basicConfig so it joins the existing handler chain.
+# We import here (before the main try/except block) so the handler is installed
+# as early as possible and captures all startup log lines.
+try:
+    from src.monitor_server import LogCapture as _LogCapture
+except ImportError:
+    from monitor_server import LogCapture as _LogCapture
+_log_capture = _LogCapture(maxlen=200)
+logging.getLogger().addHandler(_log_capture)
+
 # Suppress noisy loggers
 logging.getLogger("websockets").setLevel(logging.WARNING)
 logging.getLogger("websockets.client").setLevel(logging.WARNING)
@@ -33,6 +44,7 @@ try:
     from src.face_watcher import FaceWatcher
     from src.face_identifier import FaceIdentifier
     from src.robot_mcp_server import RobotMCPServer
+    from src.monitor_server import MonitorServer, LogCapture
 except ImportError:
     # Fallback for running directly from src/
     try:
@@ -45,6 +57,7 @@ except ImportError:
         from face_watcher import FaceWatcher
         from face_identifier import FaceIdentifier
         from robot_mcp_server import RobotMCPServer
+        from monitor_server import MonitorServer, LogCapture
         from reachy_mini import ReachyMini
     except ImportError as e:
         logger.error(f"Import Error: {e}")
@@ -134,6 +147,18 @@ async def main():
     # 8. Launch Audio Stream
     logger.info("Launching Audio Stream...")
     stream.launch()
+
+    # 8b. Start Monitor Server (non-blocking background thread)
+    logger.info("Starting MonitorServer on :8765 ...")
+    monitor = MonitorServer(
+        robot=robot,
+        face_watcher=watcher,
+        moves=moves,
+        memory=memory,
+        log_capture=_log_capture,
+        port=8765,
+    )
+    monitor.start()
 
     # 9. Start Brain Loop (blocks until shutdown)
     logger.info("Starting Brain Loop (Gemini Live)...")

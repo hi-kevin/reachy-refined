@@ -115,6 +115,10 @@ class FaceWatcher:
         # async callbacks from this background thread.
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
 
+        # Latest frame slot — written by _detect_face(), read by MonitorServer
+        self._latest_frame: Optional[np.ndarray] = None
+        self._latest_frame_lock = threading.Lock()
+
         # Debug stats
         self._stats_time: float = 0.0
         self._stats_frames: int = 0
@@ -170,6 +174,17 @@ class FaceWatcher:
     def current_person_name(self) -> str:
         with self._identify_lock:
             return self._current_person_name
+
+    @property
+    def latest_frame(self) -> Optional[np.ndarray]:
+        """Most recent camera frame captured by the face watcher loop.
+
+        Thread-safe. Returns None only before the first frame arrives.
+        Used by MonitorServer to stream video without making independent
+        get_frame() calls (which compete with the GStreamer pipeline).
+        """
+        with self._latest_frame_lock:
+            return self._latest_frame
 
     def force_sleep(self) -> None:
         """Immediately transition to SLEEPING, bypassing the face-timeout.
@@ -361,6 +376,11 @@ class FaceWatcher:
         if frame is None:
             self._stats_none_frames += 1
             return False, None
+
+        # Cache the latest frame so MonitorServer can stream it without
+        # competing with this loop for the GStreamer pipeline.
+        with self._latest_frame_lock:
+            self._latest_frame = frame
 
         self._stats_frames += 1
 
