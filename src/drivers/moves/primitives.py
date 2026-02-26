@@ -126,7 +126,9 @@ class BreathingMove(Move):
             antennas = np.array([antenna_sway, -antenna_sway], dtype=np.float64)
 
         # Return in official Move interface format: (head_pose, antennas_array, body_yaw)
-        return (head_pose, antennas, 0.0)
+        # body_yaw=None so MovementManager preserves the last cached yaw —
+        # face tracking offsets handle yaw while breathing.
+        return (head_pose, antennas, None)
 
 
 class AntennaMove(Move):

@@ -183,7 +183,7 @@ class CognitiveBrain:
                 logger.info("Gemini fallback guessed: %s", guessed_name)
                 return guessed_name
 
-            logger.info("Gemini fallback: unknown face — %s", descriptio)
+            logger.info("Gemini fallback: unknown face — %s", description)
             return None
         except Exception as e:
             logger.warning("identify_unknown_face error: %s", e)
@@ -582,10 +582,11 @@ class CognitiveBrain:
                             result_text = await self._dispatch_tool(fc.name, args)
 
                             await self._session.send(
-                                input=types.ToolResponse(
+                                input=types.LiveClientToolResponse(
                                     function_responses=[
                                         types.FunctionResponse(
                                             name=fc.name,
+                                            id=fc.id,
                                             response={"result": result_text},
                                         )
                                     ]
