@@ -171,6 +171,39 @@ TOOL_DECLARATIONS: List[Dict[str, Any]] = [
         "parameters": {},
         "required": [],
     },
+    {
+        "name": "register_face",
+        "description": (
+            "Capture photos of the current person and register their face for future recognition. "
+            "Call this when the user tells you their name and wants to be remembered visually. "
+            "Will take 5 photos over ~2.5 seconds — ask the user to look at the camera."
+        ),
+        "parameters": {
+            "name": {
+                "type": "STRING",
+                "description": "The person's name to register.",
+            }
+        },
+        "required": ["name"],
+    },
+    {
+        "name": "who_am_i_talking_to",
+        "description": (
+            "Return the name and recognition status of the person currently in view. "
+            "Use this when you are unsure who you are speaking with."
+        ),
+        "parameters": {},
+        "required": [],
+    },
+    {
+        "name": "my_memories",
+        "description": (
+            "Return a summary of what Reachy remembers about the current person. "
+            "Use this to recall long-term context about who you are talking to."
+        ),
+        "parameters": {},
+        "required": [],
+    },
 ]
 
 
@@ -181,9 +214,13 @@ class RobotMCPServer:
         self,
         movement_manager: "MovementManager",
         face_watcher: Optional["FaceWatcher"] = None,
+        face_identifier: Optional[Any] = None,
+        memory_server: Optional[Any] = None,
     ) -> None:
         self.manager = movement_manager
         self.face_watcher = face_watcher
+        self.face_identifier = face_identifier
+        self.memory_server = memory_server
 
     # ------------------------------------------------------------------
     # Tool dispatcher — single entry point used by CognitiveBrain
@@ -201,6 +238,9 @@ class RobotMCPServer:
             "tilt_head": self._tilt_head,
             "go_to_sleep": self._go_to_sleep,
             "get_robot_status": self._get_robot_status,
+            "register_face": self._register_face,
+            "who_am_i_talking_to": self._who_am_i_talking_to,
+            "my_memories": self._my_memories,
         }
         handler = handlers.get(tool_name)
         if handler is None:
@@ -380,3 +420,43 @@ class RobotMCPServer:
             f"loop_freq_mean: {status['loop_frequency']['mean']:.1f} Hz",
         ]
         return "\n".join(lines)
+
+    async def _register_face(self, args: Dict[str, Any]) -> str:
+        name = str(args.get("name", "")).strip()
+        if not name:
+            return "Please provide a name to register."
+        if self.face_identifier is None:
+            return "Face identifier not available."
+
+        robot = self.manager.current_robot
+        try:
+            # capture_training_images is blocking (camera I/O + sleep) — run off-thread
+            result = await asyncio.to_thread(
+                self.face_identifier.capture_training_images, robot, name, 5
+            )
+            # Create or update the person record in memory
+            if self.memory_server is not None:
+                self.memory_server.get_or_create_person(
+                    face_label=name, display_name=name
+                )
+            return f"Registered face for {name}. {result}"
+        except Exception as e:
+            logger.error("register_face error: %s", e)
+            return f"Registration failed: {e}"
+
+    async def _who_am_i_talking_to(self, args: Dict[str, Any]) -> str:
+        if self.face_watcher is None:
+            return "Face watcher not available."
+        name = self.face_watcher.current_person_name
+        pid = self.face_watcher.current_person_id
+        if name and name != "Unknown" and pid is not None:
+            return f"You are talking to {name} (person_id={pid})."
+        return "I don't recognise the person in view. Their name is unknown."
+
+    async def _my_memories(self, args: Dict[str, Any]) -> str:
+        if self.face_watcher is None or self.memory_server is None:
+            return "Memory or face watcher not available."
+        pid = self.face_watcher.current_person_id
+        if pid is None:
+            return "I don't know who I'm talking to yet."
+        return self.memory_server.get_person_context(pid)

@@ -162,11 +162,13 @@ class LocalStream:
         """Fetch outputs from the handler and play audio frames."""
         output_sample_rate = self._robot.media.get_output_audio_samplerate()
         logger.debug(f"Audio playback started at {output_sample_rate} Hz")
+        _speaker_active_logged = False
 
         while not self._stop_event.is_set():
             handler_output = await self.handler.emit()
 
             if handler_output is TURN_END:
+                _speaker_active_logged = False
                 pass  # sentinel consumed, nothing to do
 
             elif handler_output is not None:
@@ -192,7 +194,9 @@ class LocalStream:
                 duration = len(audio_frame) / output_sample_rate
                 self._playback_end_time = time.time() + duration + 0.1
 
-                logger.debug(f"Pushing {len(audio_frame)} samples to speaker")
+                if not _speaker_active_logged:
+                    logger.info(f"[SPEAKER START] {len(audio_frame)} samples to speaker")
+                    _speaker_active_logged = True
                 # Run in thread to avoid blocking the event loop (GStreamer appsrc can block)
                 await asyncio.to_thread(self._robot.media.push_audio_sample, audio_frame)
 

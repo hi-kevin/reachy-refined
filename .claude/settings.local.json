@@ -7,7 +7,9 @@
       "Bash(curl:*)",
       "Bash(cmd /c:*)",
       "Bash(powershell -Command:*)",
-      "Bash(echo:*)"
+      "Bash(echo:*)",
+      "Bash(scp:*)",
+      "Bash(python3:*)"
     ]
   }
 }

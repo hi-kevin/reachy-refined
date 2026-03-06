@@ -238,10 +238,18 @@ class MovementManager:
                 logger.info("MovementManager: entering SLEEP mode — breathing suppressed")
             elif not self._sleeping and was_sleeping:
                 logger.info("MovementManager: entering AWAKE mode — breathing enabled")
-                # Stay at current scan yaw — the robot just found someone so it
-                # should remain pointing in that direction; face tracking takes over.
+                # Kill any in-flight scan move so it doesn't keep driving body_yaw.
+                self.move_queue.clear()
+                self.state.current_move = None
+                self.state.move_start_time = None
                 self._scan_index = 0
                 self._scan_yaw = 0.0
+                # Reset primary body_yaw to neutral; face tracking secondary
+                # offsets will steer from here.
+                if self.state.last_primary_pose is not None:
+                    head, ant, _ = self.state.last_primary_pose
+                    self.state.last_primary_pose = (head, ant, 0.0)
+                self._breathing_active = False
                 self.state.update_activity()  # restart idle timer for breathing
         elif command == "set_listening":
             desired_state = bool(payload)
