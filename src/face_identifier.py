@@ -26,8 +26,8 @@ RECOGNIZER_MODEL_PATH = "face_recognizer.yml"
 LABEL_MAP_PATH = "label_map.pkl"
 LBPH_THRESHOLD = 80          # LBPH distance: lower is better; < this → known
 HAAR_SCALE = 1.1
-HAAR_MIN_NEIGHBORS = 5
-HAAR_MIN_SIZE = (40, 40)
+HAAR_MIN_NEIGHBORS = 9       # raised from 5 — reduces false positives
+HAAR_MIN_SIZE = (80, 80)     # raised from (40,40) — ignores tiny spurious detections
 
 
 class FaceIdentifier:
@@ -53,6 +53,12 @@ class FaceIdentifier:
             self.recognizer = None
 
         self.label_map: Dict[int, str] = {}
+
+        # Runtime-tunable detection params (settable via MonitorServer)
+        self.haar_min_neighbors = HAAR_MIN_NEIGHBORS
+        self.haar_min_size = HAAR_MIN_SIZE
+        self.lbph_threshold = LBPH_THRESHOLD
+
         self.load_model()
 
     # ------------------------------------------------------------------
@@ -182,8 +188,8 @@ class FaceIdentifier:
         faces = self.face_cascade.detectMultiScale(
             gray,
             scaleFactor=HAAR_SCALE,
-            minNeighbors=HAAR_MIN_NEIGHBORS,
-            minSize=HAAR_MIN_SIZE,
+            minNeighbors=self.haar_min_neighbors,
+            minSize=self.haar_min_size,
         )
 
         if len(faces) == 0:
@@ -202,7 +208,7 @@ class FaceIdentifier:
             try:
                 label_id, dist = self.recognizer.predict(face_gray)
                 distance = float(dist)
-                if distance < LBPH_THRESHOLD:
+                if distance < self.lbph_threshold:
                     name = self.label_map.get(label_id, "Unknown")
                     is_known = True
             except Exception as e:
@@ -217,6 +223,24 @@ class FaceIdentifier:
             "bbox": (x, y, w, h),
             "is_known": is_known,
         }
+
+    def get_detection_params(self) -> dict:
+        """Return current detection tunables."""
+        return {
+            "haar_min_neighbors": self.haar_min_neighbors,
+            "haar_min_size":      self.haar_min_size[0],  # square assumed
+            "lbph_threshold":     self.lbph_threshold,
+        }
+
+    def set_detection_params(self, **kwargs) -> None:
+        """Update detection tunables at runtime. Unknown keys are ignored."""
+        if "haar_min_neighbors" in kwargs:
+            self.haar_min_neighbors = int(kwargs["haar_min_neighbors"])
+        if "haar_min_size" in kwargs:
+            s = int(kwargs["haar_min_size"])
+            self.haar_min_size = (s, s)
+        if "lbph_threshold" in kwargs:
+            self.lbph_threshold = float(kwargs["lbph_threshold"])
 
     # ------------------------------------------------------------------
     # Training data capture

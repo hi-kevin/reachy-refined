@@ -82,6 +82,23 @@ def _fetch_json_bg(path: str, result_queue: queue.Queue, tag: str) -> None:
         result_queue.put((tag, None))
 
 
+def _post_json_bg(path: str, payload: dict, result_queue: queue.Queue, tag: str) -> None:
+    """POST JSON to BASE_URL+path in a daemon thread, put (tag, data_or_None) in queue."""
+    try:
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            BASE_URL + path,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            result_queue.put((tag, data))
+    except Exception:
+        result_queue.put((tag, None))
+
+
 def _ts_short(ts: Optional[str]) -> str:
     """Trim an ISO timestamp to 'YYYY-MM-DD HH:MM'."""
     if not ts:
@@ -116,6 +133,16 @@ class MonitorApp:
         self._conn_people  = False
         self._conn_log     = False
 
+        # Detection tuning vars (populated from /detection/params on startup)
+        self._det_min_neighbors   = tk.IntVar(value=9)
+        self._det_min_face_size   = tk.IntVar(value=80)
+        self._det_wake_min_frames = tk.IntVar(value=4)
+        self._det_sleep_timeout   = tk.DoubleVar(value=15.0)
+        self._det_haar_neighbors  = tk.IntVar(value=9)
+        self._det_haar_face_size  = tk.IntVar(value=80)
+        self._det_lbph_threshold  = tk.DoubleVar(value=80.0)
+        self._det_status_var      = tk.StringVar(value="")
+
         # Track whether a fetch is in-flight (avoid pile-up)
         self._fetching: set[str] = set()
 
@@ -126,10 +153,11 @@ class MonitorApp:
         self.root.after(100, self._drain_json_queue)
 
         # Kick off first fetches (staggered slightly)
-        self.root.after(100,  lambda: self._kick_fetch("status",  "/status"))
-        self.root.after(300,  lambda: self._kick_fetch("mem",     "/memories/recent"))
-        self.root.after(500,  lambda: self._kick_fetch("people",  "/memories/people"))
-        self.root.after(700,  lambda: self._kick_fetch("log",     "/log"))
+        self.root.after(100,  lambda: self._kick_fetch("status",           "/status"))
+        self.root.after(300,  lambda: self._kick_fetch("mem",              "/memories/recent"))
+        self.root.after(500,  lambda: self._kick_fetch("people",           "/memories/people"))
+        self.root.after(700,  lambda: self._kick_fetch("log",              "/log"))
+        self.root.after(900,  lambda: self._kick_fetch("detection_params", "/detection/params"))
 
         # Frame consumer
         self.root.after(FRAME_POLL_MS, self._process_frame_queue)
@@ -176,6 +204,10 @@ class MonitorApp:
                 self._apply_people(data)
             elif tag == "log":
                 self._apply_log(data)
+            elif tag == "detection_params":
+                self._apply_detection_params(data)
+            elif tag == "detection_apply":
+                self._det_status_var.set("Applied." if data and data.get("ok") else "Failed.")
 
             # Schedule next fetch
             if tag in reschedule:
@@ -225,10 +257,12 @@ class MonitorApp:
         right.grid(row=0, column=1, sticky="nsew", padx=(4, 8), pady=8)
         right.columnconfigure(0, weight=1)
         right.rowconfigure(0, weight=0)
-        right.rowconfigure(1, weight=1)
-        right.rowconfigure(2, weight=2)
+        right.rowconfigure(1, weight=0)
+        right.rowconfigure(2, weight=1)
+        right.rowconfigure(3, weight=2)
 
         self._build_status_panel(right)
+        self._build_detection_panel(right)
         self._build_memories_panel(right)
         self._build_log_panel(right)
 
@@ -280,6 +314,88 @@ class MonitorApp:
         lbl.grid(row=row, column=2, sticky="w", padx=(0, 10), pady=1)
         return lbl
 
+    # ── Detection tuning panel ────────────────────────────────────────
+
+    def _build_detection_panel(self, parent: tk.Frame) -> None:
+        frame = tk.LabelFrame(
+            parent, text="  Detection Tuning  ",
+            bg=BG_PANEL, fg=ACCENT, font=FONT_TITLE,
+            bd=1, relief="flat", labelanchor="nw",
+        )
+        frame.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        frame.columnconfigure(1, weight=0)
+        frame.columnconfigure(3, weight=0)
+
+        def _spin(parent, label, var, from_, to, incr, row, col, tooltip=""):
+            tk.Label(parent, text=f"{label}:", bg=BG_PANEL, fg=FG_DIM,
+                     font=FONT_LABEL, anchor="e", width=16
+                     ).grid(row=row, column=col, sticky="e", padx=(6, 2), pady=2)
+            sb = tk.Spinbox(
+                parent, textvariable=var, from_=from_, to=to, increment=incr,
+                width=6, bg=BG_WIDGET, fg=FG, insertbackground=FG,
+                buttonbackground=BG_WIDGET, relief="flat", font=FONT_LABEL,
+            )
+            sb.grid(row=row, column=col + 1, sticky="w", padx=(0, 10), pady=2)
+            return sb
+
+        # Row 0: Wake detector (FaceWatcher Haar)
+        _spin(frame, "Wake minNeighbors",  self._det_min_neighbors,   1, 20, 1,  0, 0)
+        _spin(frame, "Wake minFaceSize px", self._det_min_face_size,  20, 300, 10, 0, 2)
+
+        # Row 1: Wake thresholds
+        _spin(frame, "Wake minFrames",     self._det_wake_min_frames,  1, 10, 1,  1, 0)
+        _spin(frame, "Sleep timeout s",    self._det_sleep_timeout,    1, 120, 1, 1, 2)
+
+        # Row 2: Identifier Haar + LBPH
+        _spin(frame, "ID minNeighbors",    self._det_haar_neighbors,   1, 20, 1,  2, 0)
+        _spin(frame, "ID minFaceSize px",  self._det_haar_face_size,  20, 300, 10, 2, 2)
+
+        # Row 3: LBPH threshold + apply button
+        _spin(frame, "LBPH threshold",     self._det_lbph_threshold,  20, 200, 5, 3, 0)
+
+        tk.Button(
+            frame, text="Apply", command=self._on_apply_detection,
+            bg=ACCENT, fg="#ffffff", font=FONT_LABEL,
+            relief="flat", padx=8, pady=2,
+        ).grid(row=3, column=2, sticky="w", padx=(6, 4), pady=2)
+
+        tk.Label(
+            frame, textvariable=self._det_status_var,
+            bg=BG_PANEL, fg=GREEN, font=FONT_LABEL, anchor="w",
+        ).grid(row=3, column=3, sticky="w", padx=(0, 6), pady=2)
+
+    def _apply_detection_params(self, data: Optional[dict]) -> None:
+        """Populate detection spinboxes from /detection/params response."""
+        if not data:
+            return
+        if "min_neighbors"   in data: self._det_min_neighbors.set(int(data["min_neighbors"]))
+        if "min_face_size"   in data: self._det_min_face_size.set(int(data["min_face_size"]))
+        if "wake_min_frames" in data: self._det_wake_min_frames.set(int(data["wake_min_frames"]))
+        if "sleep_timeout_s" in data: self._det_sleep_timeout.set(float(data["sleep_timeout_s"]))
+        if "haar_min_neighbors" in data: self._det_haar_neighbors.set(int(data["haar_min_neighbors"]))
+        if "haar_min_size"      in data: self._det_haar_face_size.set(int(data["haar_min_size"]))
+        if "lbph_threshold"     in data: self._det_lbph_threshold.set(float(data["lbph_threshold"]))
+
+    def _on_apply_detection(self) -> None:
+        """POST current spinbox values to /detection/params."""
+        self._det_status_var.set("Applying…")
+        payload = {
+            "min_neighbors":      self._det_min_neighbors.get(),
+            "min_face_size":      self._det_min_face_size.get(),
+            "wake_min_frames":    self._det_wake_min_frames.get(),
+            "sleep_timeout_s":    self._det_sleep_timeout.get(),
+            "haar_min_neighbors": self._det_haar_neighbors.get(),
+            "haar_min_size":      self._det_haar_face_size.get(),
+            "lbph_threshold":     self._det_lbph_threshold.get(),
+        }
+        t = threading.Thread(
+            target=_post_json_bg,
+            args=("/detection/params", payload, self._json_queue, "detection_apply"),
+            daemon=True,
+            name="post-detection",
+        )
+        t.start()
+
     # ── Recent memories panel ─────────────────────────────────────────
 
     def _build_memories_panel(self, parent: tk.Frame) -> None:
@@ -288,7 +404,7 @@ class MonitorApp:
             bg=BG_PANEL, fg=ACCENT, font=FONT_TITLE,
             bd=1, relief="flat", labelanchor="nw",
         )
-        frame.grid(row=1, column=0, sticky="nsew", pady=(0, 6))
+        frame.grid(row=2, column=0, sticky="nsew", pady=(0, 6))
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
 
@@ -311,7 +427,7 @@ class MonitorApp:
             bg=BG_PANEL, fg=ACCENT, font=FONT_TITLE,
             bd=1, relief="flat", labelanchor="nw",
         )
-        frame.grid(row=2, column=0, sticky="nsew")
+        frame.grid(row=3, column=0, sticky="nsew")
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
 

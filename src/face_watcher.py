@@ -39,13 +39,13 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 POLL_INTERVAL = 0.1           # seconds between camera polls (10 Hz)
 WAKE_WINDOW_SIZE = 10         # sliding window size for wake detection
-WAKE_MIN_FRAMES = 2           # min detections within window to wake
+WAKE_MIN_FRAMES = 4           # min detections within window to wake (raised from 2)
 SLEEP_TIMEOUT_S = 15.0        # seconds without a face before going back to sleep
 
 # Haar cascade parameters (used for the wake/sleep gate — FaceIdentifier has its own)
 SCALE_FACTOR = 1.1
-MIN_NEIGHBORS = 5
-MIN_FACE_SIZE = (40, 40)
+MIN_NEIGHBORS = 9        # raised from 5 — reduces false positives on face-like objects
+MIN_FACE_SIZE = (80, 80) # raised from (40,40) — ignores tiny spurious detections
 
 # Antenna positions (radians)
 ANTENNA_UP = np.deg2rad(90.0)
@@ -133,6 +133,12 @@ class FaceWatcher:
         if self._detector.empty():
             logger.error("FaceWatcher: failed to load Haar cascade.")
 
+        # Runtime-tunable detection params (settable via MonitorServer)
+        self._min_neighbors = MIN_NEIGHBORS
+        self._min_face_size = MIN_FACE_SIZE
+        self._wake_min_frames = WAKE_MIN_FRAMES
+        self._sleep_timeout = SLEEP_TIMEOUT_S
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -186,6 +192,34 @@ class FaceWatcher:
         with self._latest_frame_lock:
             return self._latest_frame
 
+    def get_detection_params(self) -> dict:
+        """Return current detection tunables (plus identifier params if available)."""
+        params = {
+            "min_neighbors":   self._min_neighbors,
+            "min_face_size":   self._min_face_size[0],  # square assumed
+            "wake_min_frames": self._wake_min_frames,
+            "sleep_timeout_s": self._sleep_timeout,
+        }
+        if self._identifier is not None and hasattr(self._identifier, "get_detection_params"):
+            params.update(self._identifier.get_detection_params())
+        return params
+
+    def set_detection_params(self, **kwargs) -> None:
+        """Update detection tunables at runtime. Unknown keys are ignored."""
+        if "min_neighbors" in kwargs:
+            self._min_neighbors = int(kwargs["min_neighbors"])
+        if "min_face_size" in kwargs:
+            s = int(kwargs["min_face_size"])
+            self._min_face_size = (s, s)
+        if "wake_min_frames" in kwargs:
+            self._wake_min_frames = int(kwargs["wake_min_frames"])
+        if "sleep_timeout_s" in kwargs:
+            self._sleep_timeout = float(kwargs["sleep_timeout_s"])
+        # Delegate identifier-specific params
+        if self._identifier is not None and hasattr(self._identifier, "set_detection_params"):
+            self._identifier.set_detection_params(**kwargs)
+        logger.info("FaceWatcher: detection params updated: %s", self.get_detection_params())
+
     def force_sleep(self) -> None:
         """Immediately transition to SLEEPING, bypassing the face-timeout.
 
@@ -227,7 +261,7 @@ class FaceWatcher:
                 was_awake = self._awake
 
             self._detection_window.append(detected)
-            is_face_present = sum(self._detection_window) >= WAKE_MIN_FRAMES
+            is_face_present = sum(self._detection_window) >= self._wake_min_frames
 
             if is_face_present:
                 self._last_face_time = time.monotonic()
@@ -237,7 +271,7 @@ class FaceWatcher:
                     self._enter_awake()
             else:
                 since_last_face = time.monotonic() - self._last_face_time
-                if since_last_face >= SLEEP_TIMEOUT_S:
+                if since_last_face >= self._sleep_timeout:
                     self._enter_sleep()
                 elif detected and frame is not None and self._identifier is not None:
                     # Run person identification (debounced)
@@ -388,8 +422,8 @@ class FaceWatcher:
         faces = self._detector.detectMultiScale(
             gray,
             scaleFactor=SCALE_FACTOR,
-            minNeighbors=MIN_NEIGHBORS,
-            minSize=MIN_FACE_SIZE,
+            minNeighbors=self._min_neighbors,
+            minSize=self._min_face_size,
         )
 
         found = len(faces) > 0

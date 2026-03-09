@@ -114,11 +114,12 @@ class _MonitorRequestHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = self.path.split("?")[0]
         routes = {
-            "/video":           self._handle_video,
-            "/status":          self._handle_status,
-            "/memories/recent": self._handle_memories_recent,
-            "/memories/people": self._handle_memories_people,
-            "/log":             self._handle_log,
+            "/video":             self._handle_video,
+            "/status":            self._handle_status,
+            "/memories/recent":   self._handle_memories_recent,
+            "/memories/people":   self._handle_memories_people,
+            "/log":               self._handle_log,
+            "/detection/params":  self._handle_detection_params_get,
         }
         handler = routes.get(path)
         if handler:
@@ -126,6 +127,20 @@ class _MonitorRequestHandler(http.server.BaseHTTPRequestHandler):
                 handler()
             except Exception as exc:
                 logger.warning("MonitorServer handler error (%s): %s", path, exc)
+                try:
+                    self._send_json({"error": str(exc)}, 500)
+                except Exception:
+                    pass
+        else:
+            self.send_error(404, "Not found")
+
+    def do_POST(self) -> None:
+        path = self.path.split("?")[0]
+        if path == "/detection/params":
+            try:
+                self._handle_detection_params_post()
+            except Exception as exc:
+                logger.warning("MonitorServer POST handler error (%s): %s", path, exc)
                 try:
                     self._send_json({"error": str(exc)}, 500)
                 except Exception:
@@ -306,6 +321,32 @@ class _MonitorRequestHandler(http.server.BaseHTTPRequestHandler):
     def _handle_log(self) -> None:
         lines = self._state._log_capture.get_lines(50)
         self._send_json({"lines": lines, "count": len(lines)})
+
+    # ------------------------------------------------------------------
+    # /detection/params — read/write Haar + wake tunables
+    # ------------------------------------------------------------------
+
+    def _handle_detection_params_get(self) -> None:
+        fw = self._state._face_watcher
+        if hasattr(fw, "get_detection_params"):
+            params = fw.get_detection_params()
+        else:
+            params = {}
+        self._send_json(params)
+
+    def _handle_detection_params_post(self) -> None:
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length)
+        try:
+            kwargs = json.loads(body.decode("utf-8"))
+        except Exception as exc:
+            self._send_json({"error": f"Invalid JSON: {exc}"}, 400)
+            return
+        fw = self._state._face_watcher
+        if hasattr(fw, "set_detection_params"):
+            fw.set_detection_params(**kwargs)
+        params = fw.get_detection_params() if hasattr(fw, "get_detection_params") else {}
+        self._send_json({"ok": True, "params": params})
 
     # ------------------------------------------------------------------
     # Helpers
