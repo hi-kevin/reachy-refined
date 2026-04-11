@@ -237,18 +237,24 @@ class MovementManager:
                 self._scan_yaw = 0.0
                 logger.info("MovementManager: entering SLEEP mode — breathing suppressed")
             elif not self._sleeping and was_sleeping:
-                logger.info("MovementManager: entering AWAKE mode — breathing enabled")
                 # Kill any in-flight scan move so it doesn't keep driving body_yaw.
                 self.move_queue.clear()
                 self.state.current_move = None
                 self.state.move_start_time = None
+                # Preserve the body_yaw where the face was detected so the
+                # robot keeps looking at the person.  Face tracking secondary
+                # offsets will fine-tune from this position.
+                wake_yaw = self._scan_yaw
                 self._scan_index = 0
                 self._scan_yaw = 0.0
-                # Reset primary body_yaw to neutral; face tracking secondary
-                # offsets will steer from here.
                 if self.state.last_primary_pose is not None:
                     head, ant, _ = self.state.last_primary_pose
-                    self.state.last_primary_pose = (head, ant, 0.0)
+                    self.state.last_primary_pose = (head, ant, wake_yaw)
+                logger.info(
+                    "MovementManager: entering AWAKE mode — breathing enabled, "
+                    "keeping body_yaw=%.1f°",
+                    np.rad2deg(wake_yaw),
+                )
                 self._breathing_active = False
                 self.state.update_activity()  # restart idle timer for breathing
         elif command == "set_listening":
@@ -319,10 +325,18 @@ class MovementManager:
                     self._breathing_active = True
                     self.state.update_activity()
 
+                    # Pass current body_yaw so breathing faces forward
+                    # relative to the body, not hardcoded world-frame 0°.
+                    current_body_yaw = (
+                        self.state.last_primary_pose[2]
+                        if self.state.last_primary_pose is not None
+                        else 0.0
+                    )
                     breathing_move = BreathingMove(
                         interpolation_start_pose=current_head_pose,
                         interpolation_start_antennas=current_antennas,
                         interpolation_duration=1.0,
+                        body_yaw=current_body_yaw,
                     )
                     self.move_queue.append(breathing_move)
                     logger.debug("Started breathing after %.1fs of inactivity", idle_for)

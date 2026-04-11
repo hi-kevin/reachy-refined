@@ -528,7 +528,7 @@ class FaceWatcher:
                         self._brain.set_active_person(person_id, name, context_str)
 
                     logger.info(
-                        "FaceWatcher: person '%s' linked (id=%d, session=%s)",
+                        "FaceWatcher: person '%s' linked (id=%s, session=%s)",
                         name, person_id, session_id,
                     )
                 except Exception as e:

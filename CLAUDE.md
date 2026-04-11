@@ -94,8 +94,7 @@ src/
 ## Key Components
 
 ### CognitiveBrain (`src/brain/cognitive.py`)
-- Model: `gemini-2.5-flash-native-audio-preview-12-2025`
-- API version: `v1beta`
+- Model: `gemini-3.1-flash-live-preview`
 - Audio: 16kHz in (mic), 24kHz out (Gemini) → resampled to 16kHz for robot speaker
 - Tools exposed to Gemini: `analyze_scene`, `remember`, `recall`, `register_me`, `get_memories_for_me` + all robot movement tools
 - Person context injected into system prompt at session start; updateable mid-session

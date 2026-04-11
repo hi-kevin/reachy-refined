@@ -38,7 +38,7 @@ CHANNELS = 1
 DEFAULT_CHUNK_SIZE = 512
 
 # Gemini model for native audio
-MODEL = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+MODEL = "gemini-3.1-flash-live-preview"
 
 # Try to import PyAudio (optional, for local audio)
 try:
@@ -154,11 +154,7 @@ class GeminiLiveHandler:
         logger.info(f"Queue config: send={send_queue_size}, recv={recv_queue_size}")
         logger.info(f"Video config: fps={camera_fps}, quality={jpeg_quality}, width={camera_width}")
 
-        # Initialize Gemini client with v1beta API
-        self.client = genai.Client(
-            http_options={"api_version": "v1beta"},
-            api_key=api_key,
-        )
+        self.client = genai.Client(api_key=api_key)
 
         # Audio setup (PyAudio for local, or robot hardware)
         self.pya = None
@@ -487,7 +483,7 @@ class GeminiLiveHandler:
 
         while True:
             data = await asyncio.to_thread(self.audio_stream.read, self.chunk_size, **kwargs)
-            await self.out_queue.put({"data": data, "mime_type": "audio/pcm"})
+            await self.out_queue.put({"data": data, "mime_type": "audio/pcm;rate=16000"})
 
     async def _listen_audio_robot(self) -> None:
         """Capture audio from Reachy Mini's microphone."""
@@ -533,12 +529,12 @@ class GeminiLiveHandler:
 
                 if data:
                     try:
-                        self.out_queue.put_nowait({"data": data, "mime_type": "audio/pcm"})
+                        self.out_queue.put_nowait({"data": data, "mime_type": "audio/pcm;rate=16000"})
                     except asyncio.QueueFull:
                         # Drop old audio to keep stream fresh
                         try:
                             self.out_queue.get_nowait()
-                            self.out_queue.put_nowait({"data": data, "mime_type": "audio/pcm"})
+                            self.out_queue.put_nowait({"data": data, "mime_type": "audio/pcm;rate=16000"})
                         except Exception:
                             pass
 
@@ -550,7 +546,12 @@ class GeminiLiveHandler:
         """Send queued audio/data to Gemini."""
         while True:
             msg = await self.out_queue.get()
-            await self.session.send(input=msg)
+            mime = msg.get("mime_type", "")
+            blob = types.Blob(data=msg["data"], mime_type=mime)
+            if mime.startswith("image/"):
+                await self.session.send_realtime_input(video=blob)
+            else:
+                await self.session.send_realtime_input(audio=blob)
 
     async def receive_audio(self) -> None:
         """Receive responses from Gemini and handle them."""
@@ -584,16 +585,14 @@ class GeminiLiveHandler:
 
                             # Send tool response back to Gemini
                             try:
-                                await self.session.send(
-                                    input=types.LiveClientToolResponse(
-                                        function_responses=[
-                                            types.FunctionResponse(
-                                                name=fc.name,
-                                                id=fc.id,
-                                                response={"result": result},
-                                            )
-                                        ]
-                                    )
+                                await self.session.send_tool_response(
+                                    function_responses=[
+                                        types.FunctionResponse(
+                                            name=fc.name,
+                                            id=fc.id,
+                                            response={"result": result},
+                                        )
+                                    ]
                                 )
                             except Exception as e:
                                 logger.error(f"Failed to send tool response: {e}")
@@ -762,7 +761,7 @@ class GeminiLiveHandler:
             media_resolution="MEDIA_RESOLUTION_MEDIUM",
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Zephyr")
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Kore")
                 )
             ),
             system_instruction=types.Content(

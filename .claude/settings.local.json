@@ -9,7 +9,8 @@
       "Bash(powershell -Command:*)",
       "Bash(echo:*)",
       "Bash(scp:*)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "WebFetch(domain:ai.google.dev)"
     ]
   }
 }

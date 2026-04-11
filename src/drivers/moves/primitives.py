@@ -68,6 +68,7 @@ class BreathingMove(Move):
         interpolation_start_pose: NDArray[np.float32],
         interpolation_start_antennas: Tuple[float, float],
         interpolation_duration: float = 1.0,
+        body_yaw: float = 0.0,
     ):
         """Initialize breathing move.
 
@@ -75,14 +76,19 @@ class BreathingMove(Move):
             interpolation_start_pose: 4x4 matrix of current head pose to interpolate from
             interpolation_start_antennas: Current antenna positions to interpolate from
             interpolation_duration: Duration of interpolation to neutral (seconds)
+            body_yaw: Current body yaw in radians — neutral head faces this direction
 
         """
         self.interpolation_start_pose = interpolation_start_pose
         self.interpolation_start_antennas = np.array(interpolation_start_antennas)
         self.interpolation_duration = interpolation_duration
 
-        # Neutral positions for breathing base
-        self.neutral_head_pose = create_head_pose(0, 0, 0, 0, 0, 0, degrees=True)
+        # Neutral head = looking forward relative to the body.
+        # In world frame that means the head faces the same yaw as the body.
+        c, s = np.cos(body_yaw), np.sin(body_yaw)
+        self.neutral_head_pose = np.eye(4, dtype=np.float64)
+        self.neutral_head_pose[0, 0] = c;  self.neutral_head_pose[0, 1] = -s
+        self.neutral_head_pose[1, 0] = s;  self.neutral_head_pose[1, 1] = c
         self.neutral_antennas = np.array([0.0, 0.0])
 
         # Breathing parameters
@@ -117,9 +123,11 @@ class BreathingMove(Move):
             # Phase 2: Breathing patterns from neutral base
             breathing_time = t - self.interpolation_duration
 
-            # Gentle z-axis breathing
+            # Gentle z-axis breathing applied on top of neutral (body-relative)
             z_offset = self.breathing_z_amplitude * np.sin(2 * np.pi * self.breathing_frequency * breathing_time)
-            head_pose = create_head_pose(x=0, y=0, z=z_offset, roll=0, pitch=0, yaw=0, degrees=True, mm=False)
+            breath_offset = np.eye(4, dtype=np.float64)
+            breath_offset[2, 3] = z_offset  # z translation
+            head_pose = self.neutral_head_pose @ breath_offset
 
             # Antenna sway (opposite directions)
             antenna_sway = self.antenna_sway_amplitude * np.sin(2 * np.pi * self.antenna_frequency * breathing_time)

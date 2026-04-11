@@ -39,10 +39,7 @@ class MemoryConsolidator:
     def __init__(self, memory_server, api_key: str = None):
         self.memory = memory_server
         self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
-        self.client = genai.Client(
-            api_key=self.api_key,
-            http_options={"api_version": "v1beta"},
-        )
+        self.client = genai.Client(api_key=self.api_key)
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 

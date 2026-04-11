@@ -19,7 +19,7 @@ from ..robot_mcp_server import RobotMCPServer, TOOL_DECLARATIONS as ROBOT_TOOL_D
 
 logger = logging.getLogger(__name__)
 
-MODEL_ID = "gemini-2.5-flash-native-audio-preview-12-2025"
+MODEL_ID = "gemini-3.1-flash-live-preview"
 AUDIO_SAMPLE_RATE = 16000
 AUDIO_OUT_SAMPLE_RATE = 24000
 
@@ -49,10 +49,7 @@ class CognitiveBrain:
         if not self.api_key:
             logger.error("GOOGLE_API_KEY not found.")
 
-        self.client = genai.Client(
-            api_key=self.api_key,
-            http_options={"api_version": "v1beta"},
-        )
+        self.client = genai.Client(api_key=self.api_key)
         self.output_queue: asyncio.Queue = asyncio.Queue()
         self.running = False
         self._session = None
@@ -131,7 +128,7 @@ class CognitiveBrain:
             self._active_person_name = name
             self._active_person_context = context_str
 
-        logger.info("CognitiveBrain: active person → '%s' (id=%d)", name, person_id)
+        logger.info("CognitiveBrain: active person → '%s' (id=%s)", name, person_id)
 
         # If session already running, inject context mid-session
         if (
@@ -366,14 +363,31 @@ class CognitiveBrain:
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name="Zephyr",
+                        voice_name="Kore",
                     )
                 )
             ),
+            realtime_input_config=types.RealtimeInputConfig(
+                automatic_activity_detection=types.AutomaticActivityDetection(
+                    disabled=True,
+                )
+            ),
+            input_audio_transcription=types.AudioTranscriptionConfig(),
+            output_audio_transcription=types.AudioTranscriptionConfig(),
             tools=[all_tool],
             system_instruction=types.Content(
                 parts=[types.Part(text=system_instr)]
             ),
+        )
+
+        logger.info(
+            "[CONFIG] model=%s modalities=%s voice=%s tools=%d system_instr_len=%d",
+            MODEL_ID,
+            config.response_modalities,
+            config.speech_config.voice_config.prebuilt_voice_config.voice_name
+            if config.speech_config else "None",
+            len(all_tool.function_declarations) if all_tool.function_declarations else 0,
+            len(system_instr),
         )
 
         while self._session_active or retry_count == 0:
@@ -386,7 +400,20 @@ class CognitiveBrain:
                     self._session = session
                     self._session_active = True
                     retry_count = 0
-                    logger.info("Gemini Live session established.")
+                    logger.info("Gemini Live session established. type=%s", type(session).__name__)
+                    session_methods = [m for m in dir(session) if not m.startswith("_") and callable(getattr(session, m, None))]
+                    logger.info("[SESSION] Available methods: %s", session_methods)
+
+                    # Send a startup greeting to make Gemini speak first
+                    try:
+                        logger.info("[STARTUP] Sending greeting prompt...")
+                        await session.send_realtime_input(
+                            text="Hello! Greet whoever is in front of you warmly."
+                        )
+                        logger.info("[STARTUP] Greeting prompt sent.")
+                    except Exception as e:
+                        logger.error("[STARTUP] Failed to send greeting: %s", e)
+                        traceback.print_exc()
 
                     self._receive_task = asyncio.create_task(self._receive_loop())
                     self._send_task = asyncio.create_task(self._send_loop())
@@ -451,15 +478,25 @@ class CognitiveBrain:
     # ------------------------------------------------------------------
 
     async def _send_loop(self):
-        """Consume audio from local stream and send to Gemini."""
+        """Consume audio from local stream and send to Gemini.
+
+        Uses manual VAD: tracks audio energy (RMS) and sends activity_start
+        when speech is detected, activity_end after silence.
+        """
         logger.info("[SEND] Send loop started.")
         buffer = bytearray()
         BUFFER_LIMIT = 2048
-        MIC_GAIN = 1.0
+        MIC_GAIN = 3.0
         _frames_received = 0
         _chunks_sent = 0
         _last_stats_time = time.time()
         _logged_sample_rate = False
+
+        # Manual VAD state
+        SPEECH_THRESHOLD = 0.02    # RMS threshold to detect speech
+        SILENCE_DURATION = 0.8     # seconds of silence before ending activity
+        _is_speaking = False
+        _silence_start: Optional[float] = None
 
         while self._session_active and self._session:
             try:
@@ -487,15 +524,52 @@ class CognitiveBrain:
                     data = resample(data, num_samples).astype(np.float32)
 
                 data = np.clip(data * MIC_GAIN, -1.0, 1.0)
+
+                # Manual VAD: detect speech via RMS energy
+                rms = float(np.sqrt(np.mean(data ** 2)))
+                now = time.time()
+
+                if rms > SPEECH_THRESHOLD:
+                    _silence_start = None
+                    if not _is_speaking:
+                        _is_speaking = True
+                        logger.info("[SEND] activity_start (RMS=%.4f)", rms)
+                        await self._session.send_realtime_input(
+                            activity_start=types.ActivityStart()
+                        )
+                else:
+                    if _is_speaking:
+                        if _silence_start is None:
+                            _silence_start = now
+                        elif now - _silence_start >= SILENCE_DURATION:
+                            _is_speaking = False
+                            _silence_start = None
+                            logger.info("[SEND] activity_end (silence %.1fs)", SILENCE_DURATION)
+                            await self._session.send_realtime_input(
+                                activity_end=types.ActivityEnd()
+                            )
+
                 audio_int16 = (data * 32767.0).astype(np.int16)
                 buffer.extend(audio_int16.tobytes())
 
                 if len(buffer) >= BUFFER_LIMIT:
-                    await self._session.send(
-                        input={"data": bytes(buffer), "mime_type": "audio/pcm"}
-                    )
-                    buffer.clear()
-                    _chunks_sent += 1
+                    try:
+                        await self._session.send_realtime_input(
+                            audio=types.Blob(
+                                data=bytes(buffer),
+                                mime_type="audio/pcm;rate=16000",
+                            )
+                        )
+                        buffer.clear()
+                        _chunks_sent += 1
+                        if _chunks_sent <= 3:
+                            logger.info("[SEND] Chunk #%d sent (%d bytes)", _chunks_sent, BUFFER_LIMIT)
+                    except Exception as send_err:
+                        logger.error("[SEND] send_realtime_input FAILED: %s", send_err)
+                        traceback.print_exc()
+                        buffer.clear()
+                        self._connection_lost.set()
+                        break
 
                 now = time.time()
                 if now - _last_stats_time >= 5.0:
@@ -525,7 +599,25 @@ class CognitiveBrain:
                 if not self._session:
                     break
 
+                _resp_count = 0
                 async for response in self._session.receive():
+                    _resp_count += 1
+
+                    # Dump ALL non-None fields for first 20 responses
+                    if _resp_count <= 20:
+                        fields = {}
+                        for attr in [
+                            "server_content", "tool_call", "tool_call_cancellation",
+                            "setup_complete", "go_away", "session_resumption_update",
+                            "usage_metadata", "voice_activity", "voice_activity_detection_signal",
+                        ]:
+                            val = getattr(response, attr, None)
+                            if val is not None:
+                                fields[attr] = str(val)[:200]
+                        logger.info("[RECV #%d] fields=%s", _resp_count, fields)
+
+                    if response.setup_complete:
+                        logger.info("[RECV] === SETUP COMPLETE ===")
                     if response.voice_activity_detection_signal:
                         logger.info("[RECV] VAD: %s", response.voice_activity_detection_signal)
                     if response.voice_activity:
@@ -533,25 +625,47 @@ class CognitiveBrain:
                     if response.go_away:
                         logger.warning("[RECV] GO_AWAY: %s", response.go_away)
                     if response.session_resumption_update:
-                        logger.info(
-                            "[RECV] SESSION RESUMPTION: %s",
-                            response.session_resumption_update,
-                        )
-                    if response.setup_complete:
-                        logger.info("[RECV] SETUP COMPLETE")
+                        # Only log every 10th to reduce spam
+                        if _resp_count <= 5 or _resp_count % 10 == 0:
+                            logger.info(
+                                "[RECV] SESSION RESUMPTION #%d: handle=%s consumed=%s",
+                                _resp_count,
+                                response.session_resumption_update.new_handle[:8] if response.session_resumption_update.new_handle else "None",
+                                response.session_resumption_update.last_consumed_client_message_index,
+                            )
                     if response.usage_metadata:
                         logger.info(
-                            "[RECV] USAGE: prompt=%d response=%d",
+                            "[RECV] USAGE: prompt=%s response=%s total=%s",
                             response.usage_metadata.prompt_token_count,
                             response.usage_metadata.response_token_count,
+                            getattr(response.usage_metadata, "total_token_count", "N/A"),
                         )
 
                     if response.server_content:
-                        model_turn = response.server_content.model_turn
+                        sc = response.server_content
+                        # Log transcriptions (input = what user said, output = what Gemini said)
+                        if hasattr(sc, 'input_transcription') and sc.input_transcription:
+                            logger.info("[RECV] INPUT TRANSCRIPT: %s", sc.input_transcription.text if hasattr(sc.input_transcription, 'text') else sc.input_transcription)
+                        if hasattr(sc, 'output_transcription') and sc.output_transcription:
+                            logger.info("[RECV] OUTPUT TRANSCRIPT: %s", sc.output_transcription.text if hasattr(sc.output_transcription, 'text') else sc.output_transcription)
+                        logger.info(
+                            "[RECV] SERVER_CONTENT: model_turn=%s turn_complete=%s "
+                            "generation_complete=%s interrupted=%s",
+                            bool(sc.model_turn),
+                            sc.turn_complete,
+                            sc.generation_complete,
+                            sc.interrupted,
+                        )
+                        model_turn = sc.model_turn
                         if model_turn:
-                            for part in model_turn.parts:
+                            for i, part in enumerate(model_turn.parts):
                                 if part.inline_data:
                                     mime_type = part.inline_data.mime_type
+                                    data_len = len(part.inline_data.data) if part.inline_data.data else 0
+                                    logger.info(
+                                        "[RECV] PART[%d] inline_data: mime=%s len=%d",
+                                        i, mime_type, data_len,
+                                    )
                                     if "audio" in mime_type:
                                         audio_int16 = np.frombuffer(
                                             part.inline_data.data, dtype=np.int16
@@ -559,38 +673,40 @@ class CognitiveBrain:
                                         await self.output_queue.put(
                                             (AUDIO_OUT_SAMPLE_RATE, audio_int16)
                                         )
-                                    else:
-                                        logger.info(
-                                            "[RECV] Non-audio inline_data: %s", mime_type
-                                        )
+                                        if self.output_queue.qsize() <= 3:
+                                            logger.info(
+                                                "[RECV] Queued audio: %d samples, queue_size=%d",
+                                                len(audio_int16), self.output_queue.qsize(),
+                                            )
                                 elif part.text:
-                                    logger.info("[RECV] Text: %s", part.text)
+                                    logger.info("[RECV] PART[%d] text: %s", i, part.text[:200])
+                                else:
+                                    logger.info("[RECV] PART[%d] other: %s", i, type(part))
 
-                        if response.server_content.generation_complete:
+                        if sc.generation_complete:
                             logger.info("[RECV] GENERATION COMPLETE — flushing audio")
                             await self.output_queue.put(TURN_END)
-                        if response.server_content.turn_complete:
+                        if sc.turn_complete:
                             logger.info("[RECV] TURN COMPLETE")
-                        if response.server_content.interrupted:
+                        if sc.interrupted:
                             logger.info("[RECV] INTERRUPTED")
                             await self.output_queue.put(TURN_END)
 
                     if response.tool_call:
                         for fc in response.tool_call.function_calls:
-                            logger.info("Executing tool: %s", fc.name)
+                            logger.info("Executing tool: %s(%s)", fc.name, dict(fc.args or {}))
                             args = dict(fc.args or {})
                             result_text = await self._dispatch_tool(fc.name, args)
+                            logger.info("Tool result for '%s': %s", fc.name, result_text[:200])
 
-                            await self._session.send(
-                                input=types.LiveClientToolResponse(
-                                    function_responses=[
-                                        types.FunctionResponse(
-                                            name=fc.name,
-                                            id=fc.id,
-                                            response={"result": result_text},
-                                        )
-                                    ]
-                                )
+                            await self._session.send_tool_response(
+                                function_responses=[
+                                    types.FunctionResponse(
+                                        name=fc.name,
+                                        id=fc.id,
+                                        response={"result": result_text},
+                                    )
+                                ]
                             )
 
             except asyncio.CancelledError:
@@ -677,7 +793,7 @@ class CognitiveBrain:
                 f"[Context update: You are now speaking with {name}. "
                 f"{context_str}]"
             )
-            await self._session.send(input=text, end_of_turn=True)
+            await self._session.send_realtime_input(text=text)
             logger.info("Injected person context for '%s' into live session.", name)
         except Exception as e:
             logger.warning("Failed to inject person context: %s", e)

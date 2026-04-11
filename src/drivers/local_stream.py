@@ -161,11 +161,26 @@ class LocalStream:
     async def play_loop(self) -> None:
         """Fetch outputs from the handler and play audio frames."""
         output_sample_rate = self._robot.media.get_output_audio_samplerate()
-        logger.debug(f"Audio playback started at {output_sample_rate} Hz")
+        logger.info(f"[PLAY] Play loop started. output_rate={output_sample_rate} Hz")
         _speaker_active_logged = False
+        _poll_count = 0
+        _poll_log_time = time.time()
 
         while not self._stop_event.is_set():
             handler_output = await self.handler.emit()
+            _poll_count += 1
+
+            # Log poll stats every 5 seconds
+            now = time.time()
+            if now - _poll_log_time >= 5.0:
+                qsize = getattr(self.handler, 'output_queue', None)
+                qsize = qsize.qsize() if qsize else '?'
+                logger.info(
+                    "[PLAY] polls=%d queue_size=%s got_data=%s",
+                    _poll_count, qsize, handler_output is not None,
+                )
+                _poll_count = 0
+                _poll_log_time = now
 
             if handler_output is TURN_END:
                 _speaker_active_logged = False
@@ -173,6 +188,10 @@ class LocalStream:
 
             elif handler_output is not None:
                 sr, audio_data = handler_output
+
+                # Skip tiny chunks that would resample to 0 samples
+                if len(audio_data) < 4:
+                    continue
 
                 # Reshape if needed
                 if audio_data.ndim == 2:
@@ -186,10 +205,13 @@ class LocalStream:
 
                 # Resample to output rate
                 if sr != output_sample_rate:
-                    audio_frame = resample(
-                        audio_frame,
-                        int(len(audio_frame) * output_sample_rate / sr),
-                    )
+                    target_len = int(len(audio_frame) * output_sample_rate / sr)
+                    if target_len < 1:
+                        continue  # Skip — too small to resample
+                    audio_frame = resample(audio_frame, target_len)
+
+                if len(audio_frame) == 0:
+                    continue
 
                 duration = len(audio_frame) / output_sample_rate
                 self._playback_end_time = time.time() + duration + 0.1

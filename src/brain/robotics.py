@@ -34,18 +34,11 @@ class RoboticsBrain:
             # Using a safe fallback if robot specific method is unknown
             
             frame = None
-            if hasattr(self.robot, 'camera'):
-                if hasattr(self.robot.camera, 'last_frame'):
-                     frame = self.robot.camera.last_frame
-                elif hasattr(self.robot.camera, 'get_frame'):
-                     frame = self.robot.camera.get_frame()
-            
-            # If robot is the ReachyMini wrapper from src.robot?
-            # The user code passed ReachyMini instance.
-            # Let's try to get the frame safely.
-            
+            if hasattr(self.robot, 'media') and hasattr(self.robot.media, 'get_frame'):
+                frame = self.robot.media.get_frame()
+
             if frame is None:
-                return "I can't see anything right now (Camera error)."
+                return "I can't see anything right now (Camera unavailable)."
                 
             # Frame is likely BGR (OpenCV)
             # Encode to JPEG
