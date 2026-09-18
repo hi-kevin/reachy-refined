@@ -23,6 +23,7 @@ class MemoryServer:
     def __init__(self, db_path: str = DB_PATH):
         self.db_path = db_path
         self._init_db()
+        self._migrate_schema()
 
     # ------------------------------------------------------------------
     # DB initialisation
@@ -87,6 +88,87 @@ class MemoryServer:
     # ------------------------------------------------------------------
     # People registry
     # ------------------------------------------------------------------
+
+    def _migrate_schema(self) -> None:
+        """Additive migrations for databases created by an earlier version."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cols = {r[1] for r in conn.execute("PRAGMA table_info(people)")}
+                if "face_embedding" not in cols:
+                    # 512-dim float32 ArcFace vector, stored as raw bytes.
+                    conn.execute("ALTER TABLE people ADD COLUMN face_embedding BLOB")
+                    logger.info("Migrated people table: added face_embedding column.")
+        except Exception as e:
+            logger.error("_migrate_schema error: %s", e)
+
+    # ------------------------------------------------------------------
+    # Face embeddings (ArcFace)
+    # ------------------------------------------------------------------
+
+    def set_face_embedding(self, person_id: int, embedding: bytes) -> None:
+        """Store a person's face embedding (raw float32 bytes)."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    "UPDATE people SET face_embedding=? WHERE id=?",
+                    (embedding, person_id),
+                )
+            logger.info("Stored face embedding for person_id=%s (%d bytes)",
+                        person_id, len(embedding))
+        except Exception as e:
+            logger.error("set_face_embedding error: %s", e)
+
+    def get_face_embeddings(self) -> List[Dict]:
+        """Return every person that has an enrolled face embedding."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                rows = conn.execute(
+                    "SELECT id, face_label, display_name, face_embedding"
+                    " FROM people WHERE face_embedding IS NOT NULL",
+                ).fetchall()
+            return [
+                {
+                    "id": r[0],
+                    "face_label": r[1],
+                    "display_name": r[2],
+                    "embedding": r[3],
+                }
+                for r in rows
+            ]
+        except Exception as e:
+            logger.error("get_face_embeddings error: %s", e)
+            return []
+
+    def forget_person(self, person_id: int) -> Dict[str, int]:
+        """Delete a person and everything stored about them.
+
+        Backs the `forget_me` tool. Removes memories, sessions, the face
+        embedding and the person row. Returns per-table deletion counts.
+        The caller is responsible for deleting known_faces/{name}/ images.
+        """
+        counts = {"short_term": 0, "long_term": 0, "sessions": 0, "person": 0}
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    "DELETE FROM memories_search WHERE person_id=?", (str(person_id),)
+                )
+                counts["short_term"] = conn.execute(
+                    "DELETE FROM short_term_memories WHERE person_id=?", (person_id,)
+                ).rowcount
+                counts["long_term"] = conn.execute(
+                    "DELETE FROM long_term_memories WHERE person_id=?", (person_id,)
+                ).rowcount
+                counts["sessions"] = conn.execute(
+                    "DELETE FROM sessions WHERE person_id=?", (person_id,)
+                ).rowcount
+                counts["person"] = conn.execute(
+                    "DELETE FROM people WHERE id=?", (person_id,)
+                ).rowcount
+            logger.info("forget_person(%s): %s", person_id, counts)
+            return counts
+        except Exception as e:
+            logger.error("forget_person error: %s", e)
+            return counts
 
     def get_or_create_person(self, face_label: str, display_name: str = None) -> int:
         """Return person_id for face_label, creating a new record if needed.

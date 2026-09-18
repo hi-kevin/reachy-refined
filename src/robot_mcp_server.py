@@ -175,16 +175,37 @@ TOOL_DECLARATIONS: List[Dict[str, Any]] = [
         "name": "register_face",
         "description": (
             "Capture photos of the current person and register their face for future recognition. "
-            "Call this when the user tells you their name and wants to be remembered visually. "
-            "Will take 5 photos over ~2.5 seconds — ask the user to look at the camera."
+            "A face is biometric data, so you MUST ask permission first and get a clear yes "
+            "before calling this — for example 'would you like me to remember your face so I "
+            "recognise you next time?'. Never call it on your own initiative, and never just "
+            "because someone told you their name. "
+            "Will take 5 photos over ~2.5 seconds — ask the person to look at the camera."
         ),
         "parameters": {
             "name": {
                 "type": "STRING",
                 "description": "The person's name to register.",
-            }
+            },
+            "consent_given": {
+                "type": "BOOLEAN",
+                "description": (
+                    "True only if you asked this person for permission to store their face "
+                    "and they agreed. Set false if you have not asked or they declined."
+                ),
+            },
         },
-        "required": ["name"],
+        "required": ["name", "consent_given"],
+    },
+    {
+        "name": "forget_me",
+        "description": (
+            "Permanently delete everything stored about the person you are currently talking "
+            "to: their face, their photos and all memories of them. Call this when they ask "
+            "to be forgotten or to have their data deleted. Confirm they are sure before "
+            "calling it — this cannot be undone."
+        ),
+        "parameters": {},
+        "required": [],
     },
     {
         "name": "who_am_i_talking_to",
@@ -239,6 +260,7 @@ class RobotMCPServer:
             "go_to_sleep": self._go_to_sleep,
             "get_robot_status": self._get_robot_status,
             "register_face": self._register_face,
+            "forget_me": self._forget_me,
             "who_am_i_talking_to": self._who_am_i_talking_to,
             "my_memories": self._my_memories,
         }
@@ -428,6 +450,14 @@ class RobotMCPServer:
         if self.face_identifier is None:
             return "Face identifier not available."
 
+        # A face is biometric data. Enforce consent here rather than trusting
+        # the system prompt alone — the prompt can be talked around.
+        if not bool(args.get("consent_given", False)):
+            return (
+                "Not registering: I don't have their permission yet. Ask whether they'd "
+                "like me to remember their face, and only register if they say yes."
+            )
+
         robot = self.manager.current_robot
         try:
             # capture_training_images is blocking (camera I/O + sleep) — run off-thread
@@ -443,6 +473,37 @@ class RobotMCPServer:
         except Exception as e:
             logger.error("register_face error: %s", e)
             return f"Registration failed: {e}"
+
+    async def _forget_me(self, args: Dict[str, Any]) -> str:
+        """Delete the current person's face, photos and memories. Irreversible."""
+        if self.face_watcher is None or self.memory_server is None:
+            return "Memory or face watcher not available."
+
+        pid = self.face_watcher.current_person_id
+        name = self.face_watcher.current_person_name
+        if pid is None:
+            return "I don't know who you are yet, so there's nothing stored to delete."
+
+        try:
+            counts = self.memory_server.forget_person(pid)
+            photo_msg = ""
+            if self.face_identifier is not None and name:
+                photo_msg = " " + self.face_identifier.forget(name)
+                self.face_identifier.reload_embeddings()
+
+            # Drop the now-dangling identity from the live session.
+            if hasattr(self.face_watcher, "clear_identity"):
+                self.face_watcher.clear_identity()
+
+            return (
+                f"Done — I've deleted everything I had about {name}: "
+                f"{counts['short_term']} recent memories, {counts['long_term']} "
+                f"long-term memories and {counts['sessions']} past conversations."
+                f"{photo_msg} I won't recognise them any more."
+            )
+        except Exception as e:
+            logger.error("forget_me error: %s", e)
+            return f"Could not complete the deletion: {e}"
 
     async def _who_am_i_talking_to(self, args: Dict[str, Any]) -> str:
         if self.face_watcher is None:

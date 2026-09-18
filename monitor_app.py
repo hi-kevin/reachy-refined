@@ -140,7 +140,7 @@ class MonitorApp:
         self._det_sleep_timeout   = tk.DoubleVar(value=15.0)
         self._det_haar_neighbors  = tk.IntVar(value=9)
         self._det_haar_face_size  = tk.IntVar(value=80)
-        self._det_lbph_threshold  = tk.DoubleVar(value=80.0)
+        self._det_match_threshold = tk.DoubleVar(value=0.40)
         self._det_status_var      = tk.StringVar(value="")
 
         # Track whether a fetch is in-flight (avoid pile-up)
@@ -350,8 +350,9 @@ class MonitorApp:
         _spin(frame, "ID minNeighbors",    self._det_haar_neighbors,   1, 20, 1,  2, 0)
         _spin(frame, "ID minFaceSize px",  self._det_haar_face_size,  20, 300, 10, 2, 2)
 
-        # Row 3: LBPH threshold + apply button
-        _spin(frame, "LBPH threshold",     self._det_lbph_threshold,  20, 200, 5, 3, 0)
+        # Row 3: face match threshold + apply button.
+        # Cosine similarity now, not LBPH distance: 0..1, HIGHER is stricter.
+        _spin(frame, "Face match thresh",  self._det_match_threshold, 0.0, 1.0, 0.05, 3, 0)
 
         tk.Button(
             frame, text="Apply", command=self._on_apply_detection,
@@ -374,7 +375,7 @@ class MonitorApp:
         if "sleep_timeout_s" in data: self._det_sleep_timeout.set(float(data["sleep_timeout_s"]))
         if "haar_min_neighbors" in data: self._det_haar_neighbors.set(int(data["haar_min_neighbors"]))
         if "haar_min_size"      in data: self._det_haar_face_size.set(int(data["haar_min_size"]))
-        if "lbph_threshold"     in data: self._det_lbph_threshold.set(float(data["lbph_threshold"]))
+        if "match_threshold"    in data: self._det_match_threshold.set(float(data["match_threshold"]))
 
     def _on_apply_detection(self) -> None:
         """POST current spinbox values to /detection/params."""
@@ -386,7 +387,7 @@ class MonitorApp:
             "sleep_timeout_s":    self._det_sleep_timeout.get(),
             "haar_min_neighbors": self._det_haar_neighbors.get(),
             "haar_min_size":      self._det_haar_face_size.get(),
-            "lbph_threshold":     self._det_lbph_threshold.get(),
+            "match_threshold":    self._det_match_threshold.get(),
         }
         t = threading.Thread(
             target=_post_json_bg,

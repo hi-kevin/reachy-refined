@@ -184,6 +184,18 @@ class CognitiveBrain:
                 self._event_loop,
             )
 
+    def clear_active_person(self) -> None:
+        """Forget the active person mid-session (used after forget_me).
+
+        Keeps the session open - the conversation continues, but Reachy no
+        longer holds an identity or any context for whoever it was.
+        """
+        with self._person_lock:
+            self._active_person_id = None
+            self._active_person_name = None
+            self._active_person_context = ""
+        logger.info("CognitiveBrain: active person cleared.")
+
     @property
     def active_session_id(self) -> Optional[int]:
         with self._person_lock:
@@ -362,17 +374,26 @@ class CognitiveBrain:
             types.FunctionDeclaration(
                 name="register_me",
                 description=(
-                    "Register the current speaker's face so Reachy can recognise them next time. "
-                    "Call this when the user tells you their name for the first time."
+                    "Register the current speaker's face so Reachy can recognise them next "
+                    "time. A face is biometric data: you MUST ask permission and get a clear "
+                    "yes before calling this. Someone telling you their name is NOT consent "
+                    "to store their face."
                 ),
                 parameters=types.Schema(
                     type="OBJECT",
                     properties={
                         "name": types.Schema(
                             type="STRING", description="The person's name."
-                        )
+                        ),
+                        "consent_given": types.Schema(
+                            type="BOOLEAN",
+                            description=(
+                                "True only if you asked to store their face and they "
+                                "agreed. False if you have not asked or they declined."
+                            ),
+                        ),
                     },
-                    required=["name"],
+                    required=["name", "consent_given"],
                 ),
             ),
             types.FunctionDeclaration(
@@ -437,8 +458,13 @@ class CognitiveBrain:
             "You have a long-term memory. Use 'remember' to save important details.\n"
             "Use 'recall' for general memory search.\n"
             "Use 'get_memories_for_me' to retrieve memories specific to the current person.\n"
-            "If the user tells you their name for the first time, call 'register_me' "
-            "to register their face so you can recognise them next time.\n"
+            "A person's face is private, biometric data. Before calling 'register_me' "
+            "you must ask whether they want you to remember their face, and get a clear "
+            "yes. Someone simply telling you their name is not permission. If they say "
+            "no, that is completely fine - carry on the conversation normally and do "
+            "not ask again.\n"
+            "If anyone asks to be forgotten or to have their data deleted, confirm they "
+            "are sure and then call 'forget_me'.\n"
             "Be concise in your spoken responses."
             + person_section
         )
@@ -873,7 +899,12 @@ class CognitiveBrain:
                 person_name = args.get("name", "").strip()
                 if self.robot_mcp:
                     return await self.robot_mcp.dispatch(
-                        "register_face", {"name": person_name}
+                        "register_face",
+                        {
+                            "name": person_name,
+                            # Forwarded, not assumed - register_face enforces it.
+                            "consent_given": bool(args.get("consent_given", False)),
+                        },
                     )
                 return "Registration unavailable."
 

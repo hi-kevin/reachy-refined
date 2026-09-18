@@ -190,6 +190,22 @@ class FaceWatcher:
         with self._identify_lock:
             return self._current_person_name
 
+    def clear_identity(self) -> None:
+        """Forget who we are talking to, without ending the session.
+
+        Used after forget_me deletes a person: the session must not keep
+        pointing at a person_id that no longer exists.
+        """
+        with self._identify_lock:
+            self._current_person_id = None
+            self._current_person_name = "Unknown"
+            self._last_identified_name = ""
+        self._pending_identity = None
+        self._pending_identity_count = 0
+        if self._brain is not None and hasattr(self._brain, "clear_active_person"):
+            self._brain.clear_active_person()
+        logger.info("FaceWatcher: identity cleared (forget_me).")
+
     @property
     def latest_frame(self) -> Optional[np.ndarray]:
         """Most recent camera frame captured by the face watcher loop.

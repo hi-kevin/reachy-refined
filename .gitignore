@@ -11,3 +11,4 @@ reachy-refined.code-workspace
 *.log
 *.out
 _output/
+models/

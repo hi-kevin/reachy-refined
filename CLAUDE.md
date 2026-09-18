@@ -93,8 +93,6 @@ src/
 │   └── robotics.py          # Vision: captures frames, sends to Gemini vision model
 ├── drivers/
 │   ├── local_stream.py      # Bidirectional audio bridge (robot SDK ↔ Gemini)
-│   ├── head_wobbler.py      # Audio-driven head movement offsets
-│   ├── speech_tapper.py     # Speech-driven sway offsets (VAD, loudness)
 │   └── moves/
 │       ├── core.py          # 100Hz MovementManager control loop (threaded)
 │       ├── primitives.py    # Movement primitives
@@ -102,7 +100,7 @@ src/
 ├── memory/
 │   ├── server.py            # SQLite person-aware memory store (ST/LT per person)
 │   └── consolidator.py      # Daily 2 AM job: consolidates ST → LT via Gemini
-├── face_identifier.py       # LBPH face detection/recognition (subdirectory per person)
+├── face_identifier.py       # Haar detection + ArcFace embedding recognition (subdirectory per person)
 ├── face_watcher.py          # Camera loop: AWAKE/SLEEPING state machine, identity tracking
 ├── robot_mcp_server.py      # Robot movement + identity/memory tools exposed to Gemini
 ├── audio.py                 # AudioSystem: pyttsx3 TTS + PyAudio wrapper
@@ -112,8 +110,9 @@ src/
 **Startup sequence in `main.py`:**
 1. `ReachyMini()` — robot SDK
 2. `MovementManager(robot)` — start 100Hz control loop
-3. `FaceIdentifier()` — load LBPH model
-4. `MemoryServer(db_path="memories.db")` — SQLite person-aware store
+3. `MemoryServer(db_path="memories.db")` — SQLite person-aware store
+4. `FaceIdentifier(memory_server=memory)` — load ArcFace model + enrolled embeddings
+   (memory first: face embeddings live in the `people` table)
 5. `MemoryConsolidator(memory, api_key).schedule()` — start daily 2 AM consolidation thread
 6. `RoboticsBrain(robot=robot)` — Gemini vision
 7. `CognitiveBrain(robotics_brain, memory_server)` — Gemini Live
@@ -127,7 +126,10 @@ src/
 ### CognitiveBrain (`src/brain/cognitive.py`)
 - Model: `gemini-3.8-live` (see Model Policy table above)
 - Audio: 16kHz in (mic), 24kHz out (Gemini) → resampled to 16kHz for robot speaker
-- Tools exposed to Gemini: `analyze_scene`, `remember`, `recall`, `register_me`, `get_memories_for_me` + all robot movement tools
+- Tools exposed to Gemini: `analyze_scene`, `remember`, `recall`, `register_me`, `get_memories_for_me`,
+  `forget_me` + all robot movement tools
+- Slow tools (`analyze_scene`, `register_face`, `remember`) are declared `NON_BLOCKING`
+  so they no longer stall speech; movement tools respond `SILENT`. See `TOOL_SCHEDULING`.
 - Person context injected into system prompt at session start; updateable mid-session
 - Async send/receive loops
 
@@ -146,7 +148,8 @@ src/
 
 ### FaceWatcher (`src/face_watcher.py`)
 - Camera loop with AWAKE/SLEEPING state machine (15s timeout)
-- LBPH identification every 3s; Gemini vision fallback (30s cooldown) for unknowns
+- ArcFace identification every 3s, requiring `IDENTITY_CONFIRMATIONS` (3) consecutive
+  agreeing results before committing; ER-2 vision fallback (30s cooldown) for unknowns
 - Calls `brain.set_active_person()` when identity confirmed
 - `force_sleep()` — immediate sleep bypass (used by `go_to_sleep` tool)
 
@@ -173,13 +176,15 @@ google-genai
 reachy-mini[gstreamer]
 pyttsx3
 opencv-contrib-python
+onnxruntime
 ```
 
 ## Data Files (on robot, not version-controlled)
 
 - `memories.db` — SQLite memory database
-- `face_recognizer.yml` — trained LBPH face model
-- `label_map.pkl` — face ID → name mapping
+- `models/w600k_mbf.onnx` — ArcFace recognition model (13 MB, fetched by
+  `scripts/setup_remote.bat`; not in git)
+- `face_recognizer.yml`, `label_map.pkl` — obsolete LBPH artefacts, safe to delete
 - `known_faces/` — face training images
 
 ## Branches

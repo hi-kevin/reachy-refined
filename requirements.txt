@@ -7,3 +7,4 @@ google-genai
 reachy-mini[gstreamer]
 pyttsx3
 opencv-contrib-python
+onnxruntime

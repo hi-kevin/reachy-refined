@@ -85,17 +85,19 @@ async def main():
     moves = MovementManager(robot)
     moves.start()
 
-    # 2b. Initialize FaceIdentifier (LBPH)
+    # 3. Initialize Memory Server
+    #    Created before FaceIdentifier: face embeddings live in the people
+    #    table, so the identifier needs the store to load enrolments.
+    logger.info("Initializing MemoryServer...")
+    memory = MemoryServer(db_path="memories.db")
+
+    # 3a. Initialize FaceIdentifier (ArcFace embeddings)
     logger.info("Initializing FaceIdentifier...")
-    identifier = FaceIdentifier()
+    identifier = FaceIdentifier(memory_server=memory)
     logger.info(
         "FaceIdentifier ready — known people: %s",
         identifier.known_people or "(none yet)",
     )
-
-    # 3. Initialize Memory Server
-    logger.info("Initializing MemoryServer...")
-    memory = MemoryServer(db_path="memories.db")
 
     # 3b. Initialize Memory Consolidator (daily LLM job, 2 AM)
     logger.info("Initializing MemoryConsolidator...")
