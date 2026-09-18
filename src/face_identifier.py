@@ -24,7 +24,13 @@ logger = logging.getLogger(__name__)
 KNOWN_FACES_DIR = "known_faces"
 RECOGNIZER_MODEL_PATH = "face_recognizer.yml"
 LABEL_MAP_PATH = "label_map.pkl"
-LBPH_THRESHOLD = 80          # LBPH distance: lower is better; < this → known
+# LBPH distance: lower is better; < this → known.
+# Tightened from 80. predict() always returns the nearest known label whatever
+# the face, so a loose threshold makes strangers get identified as — and told
+# the private memories of — whoever they happen to be closest to.
+# This only reduces that risk; the real fix is embedding-based recognition
+# with a genuine "no match" distance (see UPGRADE_SPEC.md W3).
+LBPH_THRESHOLD = 55
 HAAR_SCALE = 1.1
 HAAR_MIN_NEIGHBORS = 9       # raised from 5 — reduces false positives
 HAAR_MIN_SIZE = (80, 80)     # raised from (40,40) — ignores tiny spurious detections

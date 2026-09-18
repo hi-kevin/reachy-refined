@@ -10,7 +10,7 @@ from google.genai import types
 logger = logging.getLogger(__name__)
 
 # Use a capable multimodal model for vision
-VISION_MODEL_ID = "gemini-robotics-er-1.5-preview" 
+VISION_MODEL_ID = "gemini-robotics-er-2-preview"
 
 class RoboticsBrain:
     """Handles visual perception and spatial reasoning."""
@@ -21,7 +21,7 @@ class RoboticsBrain:
         if not self.api_key:
             logger.error("GOOGLE_API_KEY not found (Robotics).")
         
-        self.client = genai.Client(api_key=self.api_key, http_options={"api_version": "v1alpha"})
+        self.client = genai.Client(api_key=self.api_key)
 
     async def capture_and_analyze(self, prompt: str = "Describe what you see.") -> str:
         """Capture image from robot and analyze it."""

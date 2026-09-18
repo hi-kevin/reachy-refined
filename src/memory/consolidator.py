@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-CONSOLIDATION_MODEL = os.getenv("CONSOLIDATION_MODEL_ID", "gemini-2.5-flash")
+CONSOLIDATION_MODEL = os.getenv("CONSOLIDATION_MODEL_ID", "gemini-3.8-flash")
 CONSOLIDATION_HOUR = 2    # 2 AM
 CONSOLIDATION_MINUTE = 0
 

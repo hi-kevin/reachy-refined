@@ -9,7 +9,38 @@ The Reachy SDK: https://github.com/pollen-robotics/reachy_mini
 
 Have a look at this repo for an example of it working: https://github.com/gamepop/reachy-mini-gemini/blob/main/reachy_mini_gemini_app/gemini_handler.py
 
-And the Google API for the model we are using. DO NOT CHANGE THE MODEL. https://docs.cloud.google.com/vertex-ai/generative-ai/docs/reference/rest
+The Google API reference: https://docs.cloud.google.com/vertex-ai/generative-ai/docs/reference/rest
+
+## Model Policy
+
+**Always use the newest available models. Never downgrade to an older model
+unless the user explicitly asks for it.**
+
+This supersedes the earlier "DO NOT CHANGE THE MODEL" instruction, which is no
+longer in force.
+
+- When you encounter a pinned model ID, check whether a newer one exists before
+  accepting it. Preview and legacy models get discontinued — being one or two
+  generations behind is a bug, not a stable baseline.
+- Look the model up; do not rely on recall. Model IDs and their capabilities
+  change faster than any training cutoff.
+- Upgrading a model is a normal change and does not need permission.
+  **Downgrading does** — if you believe an older model is the right call, say so
+  and wait for an answer rather than making the change.
+- When you do change a model, note what moved and why in the commit message, and
+  check whether the new model's feature set makes surrounding code obsolete
+  (e.g. a workaround that a newer model no longer needs).
+
+Current pinned models (keep this list accurate when you change one):
+
+| Purpose | Model ID | Location |
+|---|---|---|
+| Live conversation | `gemini-3.8-live` | `src/brain/cognitive.py` |
+| Vision / spatial | `gemini-robotics-er-2-preview` | `src/brain/robotics.py` |
+| Memory consolidation | `gemini-3.8-flash` | `src/memory/consolidator.py` (env: `CONSOLIDATION_MODEL_ID`) |
+
+See `UPGRADE_SPEC.md` for the migration work these represent — the table is the
+target state, not necessarily what is in the code right now.
 
 
 ## Robot Environment
@@ -94,7 +125,7 @@ src/
 ## Key Components
 
 ### CognitiveBrain (`src/brain/cognitive.py`)
-- Model: `gemini-3.1-flash-live-preview`
+- Model: `gemini-3.8-live` (see Model Policy table above)
 - Audio: 16kHz in (mic), 24kHz out (Gemini) → resampled to 16kHz for robot speaker
 - Tools exposed to Gemini: `analyze_scene`, `remember`, `recall`, `register_me`, `get_memories_for_me` + all robot movement tools
 - Person context injected into system prompt at session start; updateable mid-session

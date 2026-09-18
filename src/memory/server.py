@@ -143,11 +143,14 @@ class MemoryServer:
         except Exception as e:
             logger.error("update_person_last_seen error: %s", e)
 
-    def find_person_by_description(self, description: str) -> List[Dict]:
-        """Return all people that have a stored Gemini description.
+    def get_described_people(self) -> List[Dict]:
+        """Return every person that has a stored appearance description.
 
-        Returns raw rows for the caller (e.g. CognitiveBrain) to compare
-        descriptions using LLM-side reasoning.
+        This is a candidate list, not a match — the caller is responsible for
+        deciding which (if any) candidate corresponds to an observed face.
+        It was previously named find_person_by_description() and took a
+        `description` argument that it ignored entirely, which made callers
+        treat the first row as a positive identification.
         """
         try:
             with sqlite3.connect(self.db_path) as conn:
@@ -165,7 +168,7 @@ class MemoryServer:
                 for r in rows
             ]
         except Exception as e:
-            logger.error("find_person_by_description error: %s", e)
+            logger.error("get_described_people error: %s", e)
             return []
 
     # ------------------------------------------------------------------
@@ -187,13 +190,36 @@ class MemoryServer:
             raise
 
     def update_session_person(self, session_id: int, person_id: int) -> None:
-        """Link a session to a person once their identity is confirmed."""
+        """Link a session to a person once their identity is confirmed.
+
+        Also back-fills any short-term memories already written in this session
+        before the face was recognised.  Those rows are stored with
+        person_id = NULL, and without this back-fill they would never be
+        returned by recall_for() for the person they actually belong to.
+        """
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute(
                     "UPDATE sessions SET person_id=? WHERE id=?",
                     (person_id, session_id),
                 )
+                cur = conn.execute(
+                    "UPDATE short_term_memories SET person_id=?"
+                    " WHERE session_id=? AND person_id IS NULL",
+                    (person_id, session_id),
+                )
+                if cur.rowcount:
+                    conn.execute(
+                        "UPDATE memories_search SET person_id=?"
+                        " WHERE source='short' AND record_id IN ("
+                        "   SELECT CAST(id AS TEXT) FROM short_term_memories"
+                        "   WHERE session_id=?)",
+                        (str(person_id), session_id),
+                    )
+                    logger.info(
+                        "Back-filled %d pre-identification memories to person %s",
+                        cur.rowcount, person_id,
+                    )
         except Exception as e:
             logger.error("update_session_person error: %s", e)
 

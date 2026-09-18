@@ -64,6 +64,10 @@ TRACK_SMOOTHING = 0.7
 # ---------------------------------------------------------------------------
 IDENTIFY_INTERVAL_S = 3.0    # run LBPH at most every N seconds when AWAKE
 FALLBACK_COOLDOWN_S = 30.0   # min seconds between Gemini fallback calls
+# Consecutive agreeing identifications required before we commit to an identity
+# and start surfacing that person's memories. A single LBPH frame is not
+# trustworthy enough to unlock someone's private history.
+IDENTITY_CONFIRMATIONS = 3
 
 
 class FaceWatcher:
@@ -107,6 +111,11 @@ class FaceWatcher:
         self._current_person_id: Optional[int] = None
         self._current_person_name: str = "Unknown"
         self._current_session_id: Optional[int] = None
+
+        # Identity confirmation state (see IDENTITY_CONFIRMATIONS). Touched
+        # only from the camera thread's identification path.
+        self._pending_identity: Optional[str] = None
+        self._pending_identity_count: int = 0
         self._last_identified_name: str = ""
         self._last_identify_time: float = 0.0
         self._last_fallback_time: float = 0.0
@@ -342,7 +351,17 @@ class FaceWatcher:
                     self._current_person_id = None
                     self._current_person_name = "Unknown"
                     self._last_identified_name = ""
+                self._pending_identity = None
+                self._pending_identity_count = 0
                 self._last_identify_time = 0.0  # force immediate LBPH attempt
+
+                # Propagate the session id to the brain. Without this, every
+                # short-term memory is written with session_id = NULL, which
+                # makes get_unconsolidated_sessions() match nothing and
+                # silently disables the whole long-term memory pipeline.
+                if self._brain is not None and hasattr(self._brain, "active_session_id"):
+                    self._brain.active_session_id = session_id
+
                 logger.info("FaceWatcher: started session %d", session_id)
             except Exception as e:
                 logger.warning("FaceWatcher: start_session failed: %s", e)
@@ -358,6 +377,13 @@ class FaceWatcher:
                 self._current_person_id = None
                 self._current_person_name = "Unknown"
                 self._last_identified_name = ""
+            self._pending_identity = None
+            self._pending_identity_count = 0
+            # Clear the brain's session id before tearing the session down so
+            # no late tool call writes a memory against a closed session.
+            if self._brain is not None and hasattr(self._brain, "active_session_id"):
+                self._brain.active_session_id = None
+
             if session_id is not None:
                 try:
                     self._memory.end_session(session_id)
@@ -476,9 +502,32 @@ class FaceWatcher:
                 return
 
             if result["is_known"]:
-                self._handle_known_person(result["name"])
+                name = result["name"]
+                # Require agreement across consecutive identifications before
+                # committing. Guards against a stranger scoring just under the
+                # LBPH threshold on one frame.
+                if name == self._pending_identity:
+                    self._pending_identity_count += 1
+                else:
+                    self._pending_identity = name
+                    self._pending_identity_count = 1
+
+                with self._identify_lock:
+                    already_committed = name == self._last_identified_name
+
+                if already_committed or self._pending_identity_count >= IDENTITY_CONFIRMATIONS:
+                    self._handle_known_person(name)
+                else:
+                    logger.debug(
+                        "FaceWatcher: '%s' seen %d/%d times — not committing yet.",
+                        name, self._pending_identity_count, IDENTITY_CONFIRMATIONS,
+                    )
             else:
-                # Gemini fallback — rate-limited, fire-and-forget
+                # Unknown face — drop any part-built identity confirmation.
+                self._pending_identity = None
+                self._pending_identity_count = 0
+
+                # Gemini fallback — rate-limited
                 now = time.monotonic()
                 if (
                     self._brain is not None
@@ -492,15 +541,42 @@ class FaceWatcher:
                         try:
                             _, buf = cv2.imencode(".jpg", crop)
                             face_b64 = base64.b64encode(buf.tobytes()).decode()
-                            asyncio.run_coroutine_threadsafe(
+                            future = asyncio.run_coroutine_threadsafe(
                                 self._brain.identify_unknown_face(face_b64),
                                 self._event_loop,
                             )
+                            # Consume the answer. Previously this future was
+                            # dropped, so the fallback could never identify
+                            # anyone no matter what it returned.
+                            future.add_done_callback(self._on_fallback_identified)
                             logger.debug("FaceWatcher: fired Gemini fallback identification.")
                         except Exception as e:
                             logger.debug("FaceWatcher: fallback encode error: %s", e)
         except Exception as e:
             logger.warning("_run_identification error: %s", e)
+
+    def _on_fallback_identified(self, future) -> None:
+        """Apply the vision-model fallback result, if it produced a name.
+
+        Runs on the event loop thread; _handle_known_person is lock-guarded.
+        """
+        try:
+            name = future.result()
+        except Exception as e:
+            logger.debug("FaceWatcher: fallback identification failed: %s", e)
+            return
+        if not name:
+            return
+        # Only act if we are still awake and still have nobody identified —
+        # LBPH may have resolved the face while the fallback was in flight.
+        with self._identify_lock:
+            already_known = self._current_person_id is not None
+            awake = self._current_session_id is not None
+        if already_known or not awake:
+            logger.debug("FaceWatcher: fallback result '%s' discarded (stale).", name)
+            return
+        logger.info("FaceWatcher: vision fallback identified '%s'", name)
+        self._handle_known_person(name)
 
     def _handle_known_person(self, name: str) -> None:
         """Update person state when LBPH recognises someone."""

@@ -19,11 +19,45 @@ from ..robot_mcp_server import RobotMCPServer, TOOL_DECLARATIONS as ROBOT_TOOL_D
 
 logger = logging.getLogger(__name__)
 
-MODEL_ID = "gemini-3.1-flash-live-preview"
+MODEL_ID = "gemini-3.8-live"
 AUDIO_SAMPLE_RATE = 16000
 AUDIO_OUT_SAMPLE_RATE = 24000
 
 TURN_END = object()
+
+# ---------------------------------------------------------------------------
+# Asynchronous (NON_BLOCKING) tool calls.
+#
+# Every tool call used to stall the conversation for its full duration — the
+# person got dead air while the vision model answered, or while register_face
+# took five photos over ~2.5s. Tools listed here run without blocking speech;
+# the value is when Gemini is allowed to surface the result.
+#
+#   SILENT    — never spoken. Movement and expression: the body language is
+#               the acknowledgement.
+#   WHEN_IDLE — delivered at the next natural pause, so the robot can say
+#               "hold still a sec" and keep talking while the camera works.
+#
+# Tools NOT listed here stay BLOCKING. Local SQLite lookups (recall,
+# my_memories) are sub-millisecond and their results are needed to answer the
+# question being asked, so deferring them would make the model reply without
+# the memory it just asked for.
+# ---------------------------------------------------------------------------
+TOOL_SCHEDULING: Dict[str, str] = {
+    # Slow, network- or camera-bound
+    "analyze_scene": types.FunctionResponseScheduling.WHEN_IDLE,
+    "register_me": types.FunctionResponseScheduling.WHEN_IDLE,
+    "register_face": types.FunctionResponseScheduling.WHEN_IDLE,
+    "remember": types.FunctionResponseScheduling.WHEN_IDLE,
+    # Movement — acknowledged by the motion itself
+    "move_head": types.FunctionResponseScheduling.SILENT,
+    "move_head_precise": types.FunctionResponseScheduling.SILENT,
+    "move_antennas": types.FunctionResponseScheduling.SILENT,
+    "express_emotion": types.FunctionResponseScheduling.SILENT,
+    "nod": types.FunctionResponseScheduling.SILENT,
+    "shake_head": types.FunctionResponseScheduling.SILENT,
+    "tilt_head": types.FunctionResponseScheduling.SILENT,
+}
 
 
 class CognitiveBrain:
@@ -78,6 +112,11 @@ class CognitiveBrain:
         # schedule coroutines via asyncio.run_coroutine_threadsafe.
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
 
+        # Session resumption handle, refreshed by the server on every
+        # session_resumption_update. Passed back on reconnect so the
+        # conversation survives the ~10 min connection cap.
+        self._resume_handle: Optional[str] = None
+
     # ------------------------------------------------------------------
     # Public wake/sleep API (called from FaceWatcher transitions)
     # ------------------------------------------------------------------
@@ -106,6 +145,10 @@ class CognitiveBrain:
                 self.output_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+        # Drop the resumption handle: the next wake is a new conversation,
+        # very possibly with a different person, and must start clean.
+        self._resume_handle = None
+
         # Clear active person so the next session gets a fresh start
         with self._person_lock:
             self._active_person_id = None
@@ -156,10 +199,14 @@ class CognitiveBrain:
     # ------------------------------------------------------------------
 
     async def identify_unknown_face(self, face_crop_b64: str) -> Optional[str]:
-        """Use Gemini vision to describe an unknown face and match to memory.
+        """Use the vision model to match an unknown face against known people.
 
         Fired asynchronously from FaceWatcher when LBPH returns Unknown.
         Rate-limited by the caller (FALLBACK_COOLDOWN_S).
+
+        Returns the matched person's name, or None when there is no confident
+        match. None is the expected, safe answer — a wrong name here means the
+        robot recites one person's private memories to another.
         """
         if not self.robotics_brain or not self.memory_server:
             return None
@@ -173,15 +220,48 @@ class CognitiveBrain:
             if not description:
                 return None
 
-            candidates = self.memory_server.find_person_by_description(description)
-            if candidates:
-                best = candidates[0]
-                guessed_name = best.get("display_name") or best.get("face_label")
-                logger.info("Gemini fallback guessed: %s", guessed_name)
-                return guessed_name
+            candidates = self.memory_server.get_described_people()
+            if not candidates:
+                logger.info("Gemini fallback: no enrolled descriptions to match against.")
+                return None
 
-            logger.info("Gemini fallback: unknown face — %s", description)
-            return None
+            # Actually ask the model which candidate this is. The previous
+            # implementation took candidates[0] — the oldest registered person —
+            # and reported it as an identification regardless of the face.
+            roster = "\n".join(
+                f"{i + 1}. {c.get('display_name') or c.get('face_label')}: "
+                f"{c.get('gemini_description')}"
+                for i, c in enumerate(candidates)
+            )
+            verdict = await self.robotics_brain.analyze_scene(
+                image_bytes,
+                "Here are people I know, with their recorded appearance:\n"
+                f"{roster}\n\n"
+                "Does the person in this image match one of them? "
+                "Answer with the number alone if you are confident. "
+                "Answer NONE if there is any doubt, or if the face could "
+                "plausibly be someone not on the list. Prefer NONE.",
+            )
+            if not verdict:
+                return None
+
+            token = verdict.strip().split()[0].strip(".:,#").upper() if verdict.strip() else ""
+            if not token.isdigit():
+                logger.info(
+                    "Gemini fallback: no confident match (verdict=%r) — %s",
+                    verdict.strip()[:60], description,
+                )
+                return None
+
+            idx = int(token) - 1
+            if not 0 <= idx < len(candidates):
+                logger.info("Gemini fallback: out-of-range choice %r", token)
+                return None
+
+            best = candidates[idx]
+            guessed_name = best.get("display_name") or best.get("face_label")
+            logger.info("Gemini fallback matched: %s", guessed_name)
+            return guessed_name
         except Exception as e:
             logger.warning("identify_unknown_face error: %s", e)
             return None
@@ -323,9 +403,14 @@ class CognitiveBrain:
             for decl in ROBOT_TOOL_DECLARATIONS
         ]
 
-        all_tool = types.Tool(
-            function_declarations=builtin_declarations + robot_declarations
-        )
+        # Mark the slow / fire-and-forget tools as asynchronous so they no
+        # longer stall the conversation while they run.
+        declarations = builtin_declarations + robot_declarations
+        for decl in declarations:
+            if decl.name in TOOL_SCHEDULING:
+                decl.behavior = types.Behavior.NON_BLOCKING
+
+        all_tool = types.Tool(function_declarations=declarations)
         logger.info(
             "Registered %d built-in + %d robot tools with Gemini.",
             len(builtin_declarations),
@@ -378,6 +463,15 @@ class CognitiveBrain:
             system_instruction=types.Content(
                 parts=[types.Part(text=system_instr)]
             ),
+            # Sliding-window compression lifts the ~15 min audio-only session
+            # cap; resumption lets a dropped connection pick the conversation
+            # back up instead of restarting cold.
+            context_window_compression=types.ContextWindowCompressionConfig(
+                sliding_window=types.SlidingWindow(),
+            ),
+            session_resumption=types.SessionResumptionConfig(
+                handle=self._resume_handle,
+            ),
         )
 
         logger.info(
@@ -393,6 +487,13 @@ class CognitiveBrain:
         while self._session_active or retry_count == 0:
             self._connection_lost.clear()
 
+            # Reuse the newest handle the server gave us. On a fresh session
+            # this is None, which is what tells us to greet.
+            resuming = self._resume_handle is not None
+            config.session_resumption = types.SessionResumptionConfig(
+                handle=self._resume_handle,
+            )
+
             try:
                 async with self.client.aio.live.connect(
                     model=MODEL_ID, config=config
@@ -404,16 +505,22 @@ class CognitiveBrain:
                     session_methods = [m for m in dir(session) if not m.startswith("_") and callable(getattr(session, m, None))]
                     logger.info("[SESSION] Available methods: %s", session_methods)
 
-                    # Send a startup greeting to make Gemini speak first
-                    try:
-                        logger.info("[STARTUP] Sending greeting prompt...")
-                        await session.send_realtime_input(
-                            text="Hello! Greet whoever is in front of you warmly."
+                    # Greet only on a genuinely new session. Re-greeting after a
+                    # mid-conversation reconnect is the bug this guards against.
+                    if resuming:
+                        logger.info(
+                            "[STARTUP] Resumed session — skipping greeting."
                         )
-                        logger.info("[STARTUP] Greeting prompt sent.")
-                    except Exception as e:
-                        logger.error("[STARTUP] Failed to send greeting: %s", e)
-                        traceback.print_exc()
+                    else:
+                        try:
+                            logger.info("[STARTUP] Sending greeting prompt...")
+                            await session.send_realtime_input(
+                                text="Hello! Greet whoever is in front of you warmly."
+                            )
+                            logger.info("[STARTUP] Greeting prompt sent.")
+                        except Exception as e:
+                            logger.error("[STARTUP] Failed to send greeting: %s", e)
+                            traceback.print_exc()
 
                     self._receive_task = asyncio.create_task(self._receive_loop())
                     self._send_task = asyncio.create_task(self._send_loop())
@@ -625,6 +732,11 @@ class CognitiveBrain:
                     if response.go_away:
                         logger.warning("[RECV] GO_AWAY: %s", response.go_away)
                     if response.session_resumption_update:
+                        sru = response.session_resumption_update
+                        # Persist the handle so a reconnect resumes rather than
+                        # restarting the conversation from scratch.
+                        if sru.resumable and sru.new_handle:
+                            self._resume_handle = sru.new_handle
                         # Only log every 10th to reduce spam
                         if _resp_count <= 5 or _resp_count % 10 == 0:
                             logger.info(
@@ -699,12 +811,19 @@ class CognitiveBrain:
                             result_text = await self._dispatch_tool(fc.name, args)
                             logger.info("Tool result for '%s': %s", fc.name, result_text[:200])
 
+                            resp: Dict[str, Any] = {"result": result_text}
+                            scheduling = TOOL_SCHEDULING.get(fc.name)
+                            if scheduling is not None:
+                                # Only meaningful for NON_BLOCKING declarations;
+                                # tells Gemini when it may surface the result.
+                                resp["scheduling"] = scheduling
+
                             await self._session.send_tool_response(
                                 function_responses=[
                                     types.FunctionResponse(
                                         name=fc.name,
                                         id=fc.id,
-                                        response={"result": result_text},
+                                        response=resp,
                                     )
                                 ]
                             )
