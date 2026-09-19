@@ -478,11 +478,20 @@ class CognitiveBrain:
                     )
                 )
             ),
-            realtime_input_config=types.RealtimeInputConfig(
-                automatic_activity_detection=types.AutomaticActivityDetection(
-                    disabled=True,
-                )
-            ),
+            # Server-side VAD (the default — do not disable it).
+            #
+            # This used to set automatic_activity_detection(disabled=True) and
+            # hand-roll VAD from RMS energy in _send_loop.  That deadlocked the
+            # conversation: with manual VAD, Gemini does not end the user's turn
+            # or respond until it receives activity_end, and on a robot the mic
+            # sits next to fans and motors, so the gained RMS never dropped back
+            # under the fixed 0.02 threshold.  activity_start fired once at
+            # startup, activity_end never fired, and the model listened forever
+            # without ever speaking.
+            #
+            # An absolute threshold cannot be tuned into reliability against a
+            # moving noise floor.  Server VAD adapts, and handles barge-in when
+            # the robot hears its own speaker.
             input_audio_transcription=types.AudioTranscriptionConfig(),
             output_audio_transcription=types.AudioTranscriptionConfig(),
             tools=[all_tool],
@@ -540,8 +549,20 @@ class CognitiveBrain:
                     else:
                         try:
                             logger.info("[STARTUP] Sending greeting prompt...")
-                            await session.send_realtime_input(
-                                text="Hello! Greet whoever is in front of you warmly."
+                            # send_client_content with turn_complete=True, not
+                            # send_realtime_input: realtime input is subject to
+                            # VAD turn-taking, so the opening prompt could sit
+                            # in an unclosed turn and never draw a reply. This
+                            # completes the turn explicitly and makes the model
+                            # speak first, deterministically.
+                            await session.send_client_content(
+                                turns=types.Content(
+                                    role="user",
+                                    parts=[types.Part(
+                                        text="Hello! Greet whoever is in front of you warmly."
+                                    )],
+                                ),
+                                turn_complete=True,
                             )
                             logger.info("[STARTUP] Greeting prompt sent.")
                         except Exception as e:
@@ -613,8 +634,9 @@ class CognitiveBrain:
     async def _send_loop(self):
         """Consume audio from local stream and send to Gemini.
 
-        Uses manual VAD: tracks audio energy (RMS) and sends activity_start
-        when speech is detected, activity_end after silence.
+        Turn boundaries are detected server-side (automatic VAD). This loop
+        only gains, resamples and forwards audio — it must not send
+        activity_start / activity_end, which are for manual-VAD mode only.
         """
         logger.info("[SEND] Send loop started.")
         buffer = bytearray()
@@ -625,11 +647,10 @@ class CognitiveBrain:
         _last_stats_time = time.time()
         _logged_sample_rate = False
 
-        # Manual VAD state
-        SPEECH_THRESHOLD = 0.02    # RMS threshold to detect speech
-        SILENCE_DURATION = 0.8     # seconds of silence before ending activity
-        _is_speaking = False
-        _silence_start: Optional[float] = None
+        # Mic level stats (diagnostics only — VAD is server-side)
+        _rms_sum = 0.0
+        _rms_frames = 0
+        _rms_peak = 0.0
 
         while self._session_active and self._session:
             try:
@@ -658,29 +679,13 @@ class CognitiveBrain:
 
                 data = np.clip(data * MIC_GAIN, -1.0, 1.0)
 
-                # Manual VAD: detect speech via RMS energy
+                # Level tracking only — turn boundaries are the server's job now.
+                # Peak is worth watching: MIC_GAIN clips anything above
+                # 1/MIC_GAIN, and clipped audio degrades recognition.
                 rms = float(np.sqrt(np.mean(data ** 2)))
-                now = time.time()
-
-                if rms > SPEECH_THRESHOLD:
-                    _silence_start = None
-                    if not _is_speaking:
-                        _is_speaking = True
-                        logger.info("[SEND] activity_start (RMS=%.4f)", rms)
-                        await self._session.send_realtime_input(
-                            activity_start=types.ActivityStart()
-                        )
-                else:
-                    if _is_speaking:
-                        if _silence_start is None:
-                            _silence_start = now
-                        elif now - _silence_start >= SILENCE_DURATION:
-                            _is_speaking = False
-                            _silence_start = None
-                            logger.info("[SEND] activity_end (silence %.1fs)", SILENCE_DURATION)
-                            await self._session.send_realtime_input(
-                                activity_end=types.ActivityEnd()
-                            )
+                _rms_sum += rms
+                _rms_frames += 1
+                _rms_peak = max(_rms_peak, float(np.max(np.abs(data))))
 
                 audio_int16 = (data * 32767.0).astype(np.int16)
                 buffer.extend(audio_int16.tobytes())
@@ -707,11 +712,18 @@ class CognitiveBrain:
                 now = time.time()
                 if now - _last_stats_time >= 5.0:
                     logger.info(
-                        "[SEND STATS] frames_in=%d chunks_sent=%d queue=%d",
+                        "[SEND STATS] frames_in=%d chunks_sent=%d queue=%d "
+                        "avg_rms=%.4f peak=%.3f%s",
                         _frames_received, _chunks_sent, self._send_queue.qsize(),
+                        (_rms_sum / _rms_frames) if _rms_frames else 0.0,
+                        _rms_peak,
+                        "  CLIPPING — lower MIC_GAIN" if _rms_peak >= 0.999 else "",
                     )
                     _frames_received = 0
                     _chunks_sent = 0
+                    _rms_sum = 0.0
+                    _rms_frames = 0
+                    _rms_peak = 0.0
                     _last_stats_time = now
 
             except asyncio.CancelledError:
@@ -943,7 +955,13 @@ class CognitiveBrain:
                 f"[Context update: You are now speaking with {name}. "
                 f"{context_str}]"
             )
-            await self._session.send_realtime_input(text=text)
+            # turn_complete=False: land the context in history without forcing
+            # a reply. Forcing one here would make Reachy interrupt itself the
+            # moment it recognises someone mid-sentence.
+            await self._session.send_client_content(
+                turns=types.Content(role="user", parts=[types.Part(text=text)]),
+                turn_complete=False,
+            )
             logger.info("Injected person context for '%s' into live session.", name)
         except Exception as e:
             logger.warning("Failed to inject person context: %s", e)

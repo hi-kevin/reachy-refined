@@ -231,12 +231,15 @@ Two things to check as part of this swap, not after it:
 - **Voice name.** `cognitive.py:373` pins `"Kore"`. Confirm it is still a valid
   prebuilt voice for 3.8-live before deploying; a bad voice name fails at
   connect.
-- **Manual VAD.** `cognitive.py:365` sets
-  `automatic_activity_detection(disabled=True)` and `_send_loop` hand-rolls VAD
-  from RMS energy (`SPEECH_THRESHOLD = 0.02`, `MIC_GAIN = 3.0`,
-  `SILENCE_DURATION = 0.8`). That workaround predates the new model — re-test
-  whether server-side VAD now performs better, and delete the hand-rolled path
-  if it does.
+- **Manual VAD — ✅ done 2026-09-19, and it was a hard bug, not a preference.**
+  With `automatic_activity_detection(disabled=True)`, Gemini never ends the
+  user's turn until it receives `activity_end`. On the robot the gained mic RMS
+  never fell back under the fixed `0.02` threshold, so `activity_start` fired
+  once at session open, `activity_end` never fired, and **the model listened
+  forever and never spoke** — presenting as "no audio from the speaker."
+  Removed the hand-rolled VAD and reverted to server-side VAD. The `[SEND
+  STATS]` line now reports `avg_rms` / `peak` with a clipping warning, since
+  `MIC_GAIN = 3.0` is still unvalidated (see below).
 
 ### M3 — Consolidator model
 
